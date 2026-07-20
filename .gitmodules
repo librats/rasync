@@ -1,0 +1,3 @@
+[submodule "src/librats"]
+	path = src/librats
+	url = git@github.com:librats/librats.git
