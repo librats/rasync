@@ -597,9 +597,10 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
     meta.size = in->written;
     meta.mtime = in->mtime;
     meta.mode = in->mode;
-    sha256_context_t final_ctx;  // recompute is unnecessary; we already verified
-    (void)final_ctx;
-    if (auto h = sha256_file(in->final_path)) meta.hash = *h;
+    // The running digest covers exactly the bytes we wrote, in order, and FileEnd
+    // already checked it against the sender's whole-file hash — re-reading the
+    // file here would only confirm what we verified.
+    meta.hash = in->result_hash;
     service_.note_local_set(in->rel_path, meta);
 
     {
