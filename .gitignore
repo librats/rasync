@@ -1,0 +1,19 @@
+# Build output
+/build/
+/build-*/
+/cmake-build-*/
+
+# Local dependency cache (GoogleTest zip, fetched on first configure)
+/.cache/
+
+# rasync runtime state, should never be committed
+.rasync/
+.rasync-tmp/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+compile_commands.json
