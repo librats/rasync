@@ -193,6 +193,52 @@ rasync --key my-project ./data
 
 Add `--lan` to restrict discovery to the local network (mDNS only).
 
+### Access control
+
+Encryption alone does not decide *who* may sync. Two levers do:
+
+**`--key <secret>` — a shared secret, and the one you should use.** The key is
+hashed into the librats handshake protocol id, which librats binds into the
+Noise_XX prologue. A peer that does not hold the same key **cannot complete the
+handshake**: no session, no manifest exchange, not one byte of the tree. That
+holds however the peer reached you — a DHT lookup, an mDNS neighbour on the LAN,
+or a hand-typed `--peer` straight at your port.
+
+```bash
+# both hosts — and nobody else
+rasync --key "$(openssl rand -hex 24)" ./data
+```
+
+The key is a password. Anyone holding it can read *and* overwrite the whole
+synced tree. It is also exposed to offline guessing: rasync announces a hash of
+it as the DHT rendezvous point, which is public by design, so a short or
+dictionary key can be brute-forced by anyone crawling the DHT. Use a long random
+one, and pass it via a file or environment variable rather than a shell history.
+
+**`--allow <peer-id>` — pin the exact peers.** Repeatable; when present, only
+those peer ids may sync. A peer id is self-certifying (it *is* the SHA-256 of the
+peer's Noise public key, proven by the handshake), so it cannot be forged. Each
+side prints its own id at startup:
+
+```
+rasync 0.1.0
+  id       3f9c…64 hex chars…
+```
+
+```bash
+rasync --key hunter2 --allow 3f9c...  ./data
+```
+
+Use it as a second line of defence if a key might leak, or on its own when
+running keyless on a trusted network. A peer that is not listed still completes
+the handshake but is then ignored outright — it is never told what the tree
+contains and never has a request served.
+
+**With neither flag, the sync is open**: any rasync build reaching your listening
+port can pull the directory and push into it. The startup banner says so in
+yellow. Without a key, prefer a firewalled port and explicit `--peer` dialling,
+and leave `--discover` off.
+
 ### One-way mirror (backup)
 
 ```bash
@@ -208,7 +254,8 @@ rasync --mirror --replica --peer web.example.com:9000 ./website-backup
 |---|---|
 | `-p, --port <n>` | Listen on TCP port `<n>` (default: ephemeral). |
 | `--peer <host:port>` | Dial a specific peer. Repeatable. |
-| `--key <secret>` | Auto-discover peers sharing this key (enables DHT + mDNS). |
+| `--key <secret>` | Shared secret. Peers must match it to complete the handshake; also keys auto-discovery (enables DHT + mDNS). See [Access control](#access-control). |
+| `--allow <peer-id>` | Only sync with this peer id (64 hex, as printed at startup). Repeatable. |
 | `--discover` | Enable DHT + mDNS discovery without a key. |
 | `--lan` | Discover on the local network only (mDNS). |
 | `--mirror` | One-way mirror instead of two-way merge. |
@@ -257,6 +304,11 @@ node_modules/
   additive syncing.
 - **Two peers per session.** The design converges any number of peers pairwise, but
   it is built and tested for the two-directory case.
+- **The shared key is symmetric.** There is one secret and it grants full read and
+  write access to the tree; there is no read-only or per-directory credential, and
+  no way to revoke one peer short of changing the key (or listing the peers you
+  keep with `--allow`). Changing the key changes the handshake protocol id, so
+  every peer must be restarted with the new one at the same time.
 - **Large single files & delta.** Delta reconstruction reads the sender's file into
   memory to run the scan; files above `256 MiB` fall back to whole-file streaming
   (always bounded memory). Everything else streams in fixed windows.
