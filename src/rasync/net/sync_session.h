@@ -124,6 +124,7 @@ private:
     void send_request(const std::string& rel_path);
     bool may_request_locked() const;  ///< a queued pull and a free window slot
     void release_pull(const std::string& rel_path);  ///< done with a path; frees a slot
+    void abandon_pull(const std::string& rel_path);  ///< …and re-check quiescence
 
     // serving (sender thread)
     void sender_loop();
@@ -135,7 +136,10 @@ private:
 
     // helpers
     void finalize_incoming(const std::shared_ptr<Incoming>& in);
-    void fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why);
+    /// Drop a transfer. The path's pull reservation goes back unless the caller is
+    /// about to re-request it — see the comment on the definition.
+    void fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why,
+                       bool keep_reservation = false);
     void send_msg(BinaryWriter& w);
     uint64_t next_xid() { return next_xid_.fetch_add(1); }
 

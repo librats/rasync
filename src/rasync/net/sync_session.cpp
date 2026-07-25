@@ -401,6 +401,13 @@ void SyncSession::release_pull(const std::string& rel_path) {
     pull_cv_.notify_one();  // a window slot just freed up
 }
 
+void SyncSession::abandon_pull(const std::string& rel_path) {
+    release_pull(rel_path);
+    // This may have been the last thing the session was waiting on, and nothing
+    // else will look: a giving-up path produces no further protocol traffic.
+    maybe_synced();
+}
+
 void SyncSession::maybe_synced() {
     Manifest remote;
     {
@@ -656,12 +663,12 @@ void SyncSession::handle_file_start(BinaryReader& r) {
     fs::remove(in->temp_path, ec);
     if (ec) {
         service_.log(2, "cannot clear stale temp file for " + in->rel_path);
-        release_pull(in->rel_path);
+        abandon_pull(in->rel_path);
         return;
     }
     if (!in->out.open_write(in->temp_path.c_str())) {
         service_.log(2, "cannot open temp file for " + in->rel_path);
-        release_pull(in->rel_path);
+        abandon_pull(in->rel_path);
         return;
     }
     if (in->is_delta) {
@@ -749,16 +756,16 @@ void SyncSession::handle_file_end(BinaryReader& r) {
     if (got != expected) {
         // Integrity failure. If this was a delta, the base may have drifted — fall
         // back to a whole-file pull once before giving up.
-        std::string path = in->rel_path;
-        bool was_delta = in->is_delta;
-        fail_incoming(in, "hash mismatch");
-        if (was_delta) {
+        const std::string path = in->rel_path;
+        const bool retry = in->is_delta;
+        // A retry keeps the reservation: the path must stay in `pulling_` so the
+        // round still waits for it and its window slot isn't handed to another pull.
+        fail_incoming(in, "hash mismatch", /*keep_reservation=*/retry);
+        if (retry) {
             service_.log(2, "delta verify failed for " + path + " — retrying whole-file");
             auto w = proto::message(proto::Op::Request);
             w.str16(path); w.u8(0);
-            send_msg(w);  // path stays in pulling_, so the round still waits for it
-        } else {
-            release_pull(path);
+            send_msg(w);
         }
         return;
     }
@@ -783,7 +790,7 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
             std::lock_guard<std::mutex> lk(mtx_);
             incoming_.erase(in->xid);
         }
-        release_pull(in->rel_path);
+        abandon_pull(in->rel_path);
         return;
     }
     in->temp_path.clear();  // moved — nothing for the dtor to clean
@@ -817,21 +824,30 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
     maybe_synced();
 }
 
-void SyncSession::fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why) {
+void SyncSession::fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why,
+                                bool keep_reservation) {
     in->failed = true;
     in->out.close();
     in->base.close();
     service_.log(2, "transfer of " + in->rel_path + " failed: " + why);
-    std::lock_guard<std::mutex> lk(mtx_);
-    incoming_.erase(in->xid);
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        incoming_.erase(in->xid);
+    }
+    // Hand the path back. A failed transfer that stayed in `pulling_` would hold
+    // one of the few window slots for the rest of the session — a handful of them
+    // stops the session requesting anything at all — and would keep it from ever
+    // looking converged. The one exception is a caller that immediately re-asks
+    // for the same path: it needs the reservation to survive, or the round would
+    // conclude while the replacement transfer is still on its way.
+    if (!keep_reservation) abandon_pull(in->rel_path);
 }
 
 void SyncSession::handle_not_found(BinaryReader& r) {
     std::string path = r.str16();
     if (!r.ok()) return;
     service_.log(2, "peer no longer has " + path);
-    release_pull(path);
-    maybe_synced();
+    abandon_pull(path);
 }
 
 } // namespace rasync
