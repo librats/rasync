@@ -6,7 +6,9 @@
 #include "core/hash.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -50,6 +52,21 @@ void set_mtime(const std::string& path, int64_t mtime) {
     RASYNC_UTIME(path.c_str(), &t);
 }
 
+// Unlink `path`, tolerating a reader that happens to hold it open. Windows keeps
+// a file undeletable while any handle is open (fopen shares read and write, never
+// delete), and the likeliest such handle is a scanner hashing the very file we are
+// dropping — a window measured in microseconds. A few short retries clear that;
+// anything longer is a real lock, and the caller must not pretend the file is gone.
+bool remove_file(const std::string& path) {
+    constexpr int kRetries = 3;
+    for (int attempt = 0;; ++attempt) {
+        std::error_code ec;
+        if (fs::remove(path, ec) || !fs::exists(path)) return true;
+        if (attempt == kRetries) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+}
+
 // Move `from` onto `to`, replacing an existing `to`, creating parent dirs.
 bool move_replace(const std::string& from, const std::string& to) {
     std::error_code ec;
@@ -58,8 +75,8 @@ bool move_replace(const std::string& from, const std::string& to) {
     fs::rename(from, dst, ec);
     if (!ec) return true;
     // Some platforms won't rename over an existing file — drop it and retry.
-    ec.clear();
-    fs::remove(dst, ec);
+    // The old copy can be held open just as briefly, hence the same tolerance.
+    remove_file(to);
     ec.clear();
     fs::rename(from, dst, ec);
     return !ec;
@@ -303,8 +320,12 @@ void SyncSession::reconcile_and_act() {
     // 1. Apply our local deletions.
     bool mutated = false;
     for (const auto& path : plan.delete_local) {
-        std::error_code ec;
-        fs::remove(service_.abs_path(path), ec);
+        if (!remove_file(service_.abs_path(path))) {
+            // Still there: say nothing to the manifest. The path stays local, so
+            // the next round reconciles it again instead of resurrecting it.
+            service_.log(2, "cannot delete " + path + " (in use) — will retry");
+            continue;
+        }
         service_.note_local_removed(path);
         mutated = true;
         service_.log(0, "deleted " + path);
