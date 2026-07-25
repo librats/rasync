@@ -219,11 +219,15 @@ int run_daemon(const Options& opt) {
                   << (cfg.propagate_deletes ? "" : term::dim("  no-delete")) << "\n";
         // Never echo the key itself — it is a password, and this line is what ends
         // up in screenshots and CI logs.
-        std::string access = opt.key.empty()
-                                 ? term::yellow("open — any rasync peer that reaches this port can sync")
-                                 : term::green("shared key");
-        if (!cfg.allowed_peers.empty())
-            access += term::gray(" · " + std::to_string(cfg.allowed_peers.size()) + " allowed peer(s)");
+        const std::string listed = std::to_string(cfg.allowed_peers.size()) + " allowed peer(s)";
+        std::string access;
+        if (!opt.key.empty())
+            access = term::green("shared key") +
+                     (cfg.allowed_peers.empty() ? "" : term::gray(" · " + listed));
+        else if (!cfg.allowed_peers.empty())
+            access = term::green("allow-list") + term::gray(" · " + listed + ", no shared key");
+        else
+            access = term::yellow("open — any rasync peer that reaches this port can sync");
         std::cout << term::gray("  access   ") << access << "\n";
         std::cout << term::gray("  listen   ") << "port " << node.listen_port() << "\n";
         if (opt.discover)
