@@ -55,13 +55,15 @@ struct Endpoint {
     Manifest      current;
 
     explicit Endpoint(SyncMode mode = SyncMode::TwoWay, bool source = false,
-                      size_t max_update_bytes = 0)
+                      size_t max_update_bytes = 0,
+                      ConflictPolicy conflict = ConflictPolicy::Newer)
         : scanner(make_ignore()) {
         root = dir.str();
         cfg.root = root;
         cfg.data_dir = dir.sub(".rasync");
         cfg.mode = mode;
         cfg.source = source;
+        cfg.conflict = conflict;
         if (max_update_bytes) cfg.max_update_bytes = max_update_bytes;
 
         librats::NodeConfig ncfg;
@@ -136,12 +138,16 @@ struct RawPeer {
         node->send(to, proto::kChannel, librats::ByteView(w.buffer()));
     }
 
-    /// A Hello claiming `version`; everything after it is what an honest peer sends.
-    void say_hello(const librats::PeerId& to, uint8_t version) {
+    /// A Hello claiming `version`, `mode` and `conflict`; the rest is what an honest
+    /// peer sends. Each of the three is something a real misconfiguration can get
+    /// wrong, and only a peer we control can get it wrong on purpose.
+    void say_hello(const librats::PeerId& to, uint8_t version,
+                   SyncMode mode = SyncMode::TwoWay,
+                   ConflictPolicy conflict = ConflictPolicy::Newer) {
         auto w = proto::message(proto::Op::Hello);
         w.u8(version);
-        w.u8(static_cast<uint8_t>(SyncMode::TwoWay));
-        w.u8(static_cast<uint8_t>(ConflictPolicy::Newer));
+        w.u8(static_cast<uint8_t>(mode));
+        w.u8(static_cast<uint8_t>(conflict));
         w.u64(0);
         w.str16("raw-peer");
         send(to, w);
@@ -444,6 +450,102 @@ TEST(SyncIntegration, PeerWithAnIncompatibleProtocolVersionIsRefused) {
     EXPECT_EQ(updates.load(), 0) << "A advertised to an incompatible peer";
     EXPECT_EQ(a.svc->advert_messages(), 0u);
     EXPECT_EQ(byes.load(), 1) << "refusal announced more than once";
+}
+
+TEST(SyncIntegration, PeerWithANonComplementaryConflictPolicyIsRefused) {
+    // Two peers converge only because their plans are complements, which holds only
+    // while they resolve conflicts complementarily. A mismatched pair either stalls
+    // forever (both sides think they won) or swaps the two versions round after round
+    // (both think they lost) — and neither says so. Catch it at the handshake.
+    Endpoint a;  // default policy: newer, whose complement is newer
+    test::write_file(a.dir.sub("a.txt"), "content");
+    a.start();
+
+    std::atomic<int> byes{0};
+    std::atomic<int> updates{0};
+    RawPeer peer;
+    peer.on_message([&](const librats::PeerId& from, proto::Op op, BinaryReader&) {
+        switch (op) {
+            case proto::Op::Hello:
+                peer.say_hello(from, proto::kVersion, SyncMode::TwoWay,
+                               ConflictPolicy::PreferLocal);  // wants to always win
+                break;
+            case proto::Op::Bye:            byes.fetch_add(1); break;
+            case proto::Op::ManifestUpdate: updates.fetch_add(1); break;
+            default: break;
+        }
+    });
+    ASSERT_TRUE(peer.node->start());
+    peer.node->connect("127.0.0.1", a.port());
+
+    ASSERT_TRUE(wait_until([&] { return byes.load() > 0; }, milliseconds(10000)))
+        << "the mismatched peer was never told the session is off";
+
+    std::this_thread::sleep_for(milliseconds(300));
+    EXPECT_EQ(updates.load(), 0) << "A synced with a peer it can never converge with";
+    EXPECT_EQ(a.svc->advert_messages(), 0u);
+    EXPECT_EQ(byes.load(), 1) << "refusal announced more than once";
+}
+
+TEST(SyncIntegration, ComplementaryConflictPoliciesArePairedUp) {
+    // The other half of the rule: "local" is meant to pair with "remote", and that
+    // pairing must sail straight through — the check has to reject a bad pair, not
+    // every pair that isn't identical.
+    Endpoint a(SyncMode::TwoWay, /*source=*/false, /*max_update_bytes=*/0,
+               ConflictPolicy::PreferLocal);
+    test::write_file(a.dir.sub("a.txt"), "content");
+    a.start();
+
+    std::atomic<int> byes{0};
+    std::atomic<int> updates{0};
+    RawPeer peer;
+    peer.on_message([&](const librats::PeerId& from, proto::Op op, BinaryReader&) {
+        switch (op) {
+            case proto::Op::Hello:
+                peer.say_hello(from, proto::kVersion, SyncMode::TwoWay,
+                               ConflictPolicy::PreferRemote);  // agrees to lose
+                break;
+            case proto::Op::Bye:            byes.fetch_add(1); break;
+            case proto::Op::ManifestUpdate: updates.fetch_add(1); break;
+            default: break;
+        }
+    });
+    ASSERT_TRUE(peer.node->start());
+    peer.node->connect("127.0.0.1", a.port());
+
+    ASSERT_TRUE(wait_until([&] { return updates.load() > 0; }, milliseconds(10000)))
+        << "a complementary peer was not synced with";
+    EXPECT_EQ(byes.load(), 0) << "a complementary peer was refused";
+}
+
+TEST(SyncIntegration, MirrorIgnoresTheConflictPolicyPairing) {
+    // Mirror mode never consults the policy — one side is authoritative by
+    // construction — so a policy that would be refused in two-way mode must not
+    // cost a mirror pair its session.
+    Endpoint src(SyncMode::Mirror, /*source=*/true);
+    test::write_file(src.dir.sub("doc.txt"), "authoritative");
+    src.start();
+
+    std::atomic<int> byes{0};
+    std::atomic<int> updates{0};
+    RawPeer peer;
+    peer.on_message([&](const librats::PeerId& from, proto::Op op, BinaryReader&) {
+        switch (op) {
+            case proto::Op::Hello:
+                peer.say_hello(from, proto::kVersion, SyncMode::Mirror,
+                               ConflictPolicy::PreferLocal);
+                break;
+            case proto::Op::Bye:            byes.fetch_add(1); break;
+            case proto::Op::ManifestUpdate: updates.fetch_add(1); break;
+            default: break;
+        }
+    });
+    ASSERT_TRUE(peer.node->start());
+    peer.node->connect("127.0.0.1", src.port());
+
+    ASSERT_TRUE(wait_until([&] { return updates.load() > 0; }, milliseconds(10000)))
+        << "a mirror peer was refused over a policy mirror mode does not use";
+    EXPECT_EQ(byes.load(), 0);
 }
 
 TEST(SyncIntegration, UnsafePeerPathsNeverEnterThePullWindow) {

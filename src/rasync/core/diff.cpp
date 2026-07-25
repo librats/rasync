@@ -115,6 +115,26 @@ std::set<std::string> union_keys(const Manifest& a, const Manifest& b, const Man
 
 } // namespace
 
+ConflictPolicy complement(ConflictPolicy p) {
+    switch (p) {
+        case ConflictPolicy::PreferLocal:  return ConflictPolicy::PreferRemote;
+        case ConflictPolicy::PreferRemote: return ConflictPolicy::PreferLocal;
+        case ConflictPolicy::Newer:
+        case ConflictPolicy::Larger:       break;  // decided by comparing the versions
+    }
+    return p;
+}
+
+const char* conflict_policy_name(ConflictPolicy p) {
+    switch (p) {
+        case ConflictPolicy::Newer:        return "newer";
+        case ConflictPolicy::Larger:       return "larger";
+        case ConflictPolicy::PreferLocal:  return "local";
+        case ConflictPolicy::PreferRemote: return "remote";
+    }
+    return "?";
+}
+
 SyncPlan reconcile(const Manifest& base, const Manifest& local,
                    const Manifest& remote, const ReconcileOptions& opts) {
     SyncPlan plan;

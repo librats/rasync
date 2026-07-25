@@ -34,6 +34,8 @@ std::string help_text(const std::string& prog) {
     o << "  " << green("    --mirror") << "             one-way mirror instead of two-way merge\n";
     o << "  " << green("    --source") << " / " << green("--replica") << "  mirror role (source is authoritative)\n";
     o << "  " << green("    --conflict") << " <policy>  newer|larger|local|remote (default: newer)\n";
+    o << "                            (peers must pair: newer/newer, larger/larger,\n";
+    o << "                             local/remote — a mismatch is refused)\n";
     o << "  " << green("    --no-delete") << "          never delete files (additive sync)\n";
     o << "  " << green("    --no-delta") << "           send whole files instead of rsync deltas\n";
     o << "  " << green("    --ignore") << " <pattern>   exclude paths (gitignore syntax, repeatable)\n";

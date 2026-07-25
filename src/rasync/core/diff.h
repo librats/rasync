@@ -28,9 +28,25 @@ namespace rasync {
 
 enum class SyncMode { TwoWay, Mirror };
 
-/// How a modify/modify (or modify/delete) conflict is resolved. Both peers must
-/// use the same policy so they pick the same winner and converge.
+/// How a modify/modify (or modify/delete) conflict is resolved. The two peers must
+/// run *complementary* policies (see `complement`) so they pick the same winner and
+/// converge — which, for `Newer` and `Larger`, means the same policy on both sides.
 enum class ConflictPolicy { Newer, Larger, PreferLocal, PreferRemote };
+
+/// The policy a peer must run for its plan to complement ours.
+///
+/// `Newer` and `Larger` compare the two versions themselves, so both peers reach the
+/// same verdict from the same policy: they are their own complement. `PreferLocal`
+/// and `PreferRemote` instead name a *side*, and "local" is a different tree on each
+/// peer — two peers both preferring local each keep their own version, so both plan a
+/// push, neither ever pulls, and the trees never converge. Their complement is each
+/// other. `complement(complement(p)) == p` for every policy, so the pairing rule reads
+/// the same from either end.
+ConflictPolicy complement(ConflictPolicy p);
+
+/// The `--conflict` spelling of a policy ("newer", "larger", "local", "remote"), so
+/// a diagnostic can name the flag the user would actually type.
+const char* conflict_policy_name(ConflictPolicy p);
 
 struct ReconcileOptions {
     SyncMode       mode             = SyncMode::TwoWay;

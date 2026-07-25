@@ -47,6 +47,20 @@ size_t sanitize(ManifestPatch& patch) {
     return before - patch.set.size();
 }
 
+// Name a conflict policy that arrived as a raw byte. A peer is free to send a
+// value that is no policy at all, and the diagnostic has to stay readable when it
+// does — so this never casts an unknown byte into the enum.
+std::string describe_conflict(uint8_t raw) {
+    switch (static_cast<ConflictPolicy>(raw)) {
+        case ConflictPolicy::Newer:
+        case ConflictPolicy::Larger:
+        case ConflictPolicy::PreferLocal:
+        case ConflictPolicy::PreferRemote:
+            return conflict_policy_name(static_cast<ConflictPolicy>(raw));
+    }
+    return "unknown policy " + std::to_string(raw);
+}
+
 void set_mtime(const std::string& path, int64_t mtime) {
     utimbuf_t t{};
     t.actime = static_cast<decltype(t.actime)>(mtime);
@@ -171,28 +185,54 @@ void SyncSession::send_hello() {
 
 void SyncSession::handle_hello(BinaryReader& r) {
     uint8_t version = r.u8();
-    auto peer_mode = static_cast<SyncMode>(r.u8());
-    r.u8();          // conflict policy (informational)
+    auto    peer_mode = static_cast<SyncMode>(r.u8());
+    uint8_t peer_conflict = r.u8();
     r.u64();         // base generation (informational)
     r.str16();       // name
     if (!r.ok()) return;
-    if (version != proto::kVersion) {
-        // Refuse the peer instead of carrying on. The shape of a tree description
-        // changed in v2, so a mismatched peer's updates decode as garbage: both
-        // sides would log a malformed message per advertisement and silently never
-        // converge, which is indistinguishable from a stalled sync. Going inert and
-        // saying so once is the honest outcome. Bye is understood by every version,
-        // so the peer learns of it too.
-        service_.log(2, "peer speaks protocol v" + std::to_string(version) +
-                        ", we speak v" + std::to_string(proto::kVersion) +
-                        " — not syncing with this peer");
+
+    // Go inert and say so once. A peer we cannot converge with is worse than no
+    // peer: the two sides keep talking and the sync silently never finishes, which
+    // is indistinguishable from a stall. Bye is understood by every version, so the
+    // peer learns of it too.
+    auto refuse = [&](const std::string& why) {
+        service_.log(2, why + " — not syncing with this peer");
         incompatible_.store(true);
         auto w = proto::message(proto::Op::Bye);
         send_msg(w);
+    };
+
+    if (version != proto::kVersion) {
+        // The shape of a tree description changed in v2, so a mismatched peer's
+        // updates decode as garbage: both sides would log a malformed message per
+        // advertisement and never converge.
+        refuse("peer speaks protocol v" + std::to_string(version) +
+               ", we speak v" + std::to_string(proto::kVersion));
         return;
     }
-    if (peer_mode != service_.config().mode)
+
+    if (peer_mode != service_.config().mode) {
         service_.log(2, "peer sync mode differs from ours — results may be surprising");
+    } else if (service_.config().mode == SyncMode::TwoWay) {
+        // Reconciliation only converges because the two plans are complements, and
+        // that holds only if the peer resolves conflicts with the complementary
+        // policy. Mismatched policies do not merely pick a surprising winner: both
+        // sides can decide they won (nothing is ever transferred, the sync stalls
+        // forever) or both decide they lost (the two versions swap places on every
+        // round, forever). Neither announces itself, so catch it at the handshake.
+        // Mirror mode ignores the policy entirely, hence the guard.
+        const ConflictPolicy ours   = service_.config().conflict;
+        const ConflictPolicy wanted = complement(ours);
+        // Compared as the raw byte on purpose: a value that is no policy at all
+        // fails this too, rather than being cast into one.
+        if (peer_conflict != static_cast<uint8_t>(wanted)) {
+            refuse(std::string("peer resolves conflicts by '") +
+                   describe_conflict(peer_conflict) + "', which cannot pair with our '" +
+                   conflict_policy_name(ours) + "' (run the peer with --conflict " +
+                   conflict_policy_name(wanted) + ")");
+            return;
+        }
+    }
     // Bootstrap the exchange: describe our current tree.
     advertise();
 }

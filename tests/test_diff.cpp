@@ -116,6 +116,81 @@ TEST(Diff, ConflictResolutionIsSymmetric) {
     EXPECT_EQ(has(pb.pull, "f"), a_pushes);
 }
 
+TEST(Diff, ComparingPoliciesAreTheirOwnComplement) {
+    EXPECT_EQ(complement(ConflictPolicy::Newer), ConflictPolicy::Newer);
+    EXPECT_EQ(complement(ConflictPolicy::Larger), ConflictPolicy::Larger);
+    EXPECT_EQ(complement(ConflictPolicy::PreferLocal), ConflictPolicy::PreferRemote);
+    EXPECT_EQ(complement(ConflictPolicy::PreferRemote), ConflictPolicy::PreferLocal);
+    // The pairing rule has to read the same from either end, or the two peers would
+    // each demand a different policy of the other and neither handshake would pass.
+    for (auto p : {ConflictPolicy::Newer, ConflictPolicy::Larger,
+                   ConflictPolicy::PreferLocal, ConflictPolicy::PreferRemote})
+        EXPECT_EQ(complement(complement(p)), p);
+}
+
+TEST(Diff, ComplementaryPreferencePoliciesResolveConflictsSymmetrically) {
+    // "prefer local" only converges when the peer prefers remote: each names a side,
+    // and "local" is a different tree on each peer.
+    Manifest base;
+    base.set("f", fm("v0", 10));
+    Manifest a, b;
+    a.set("f", fm("A", 200));
+    b.set("f", fm("B", 300));  // newer, and still must lose: policy beats mtime
+
+    ReconcileOptions oa = two_way();
+    oa.conflict = ConflictPolicy::PreferLocal;
+    ReconcileOptions ob = two_way();
+    ob.conflict = complement(oa.conflict);
+
+    SyncPlan pa = reconcile(base, a, b, oa);
+    SyncPlan pb = reconcile(base, b, a, ob);
+
+    EXPECT_TRUE(has(pa.push, "f"));    // A keeps its own version...
+    EXPECT_FALSE(has(pa.pull, "f"));
+    EXPECT_TRUE(has(pb.pull, "f"));    // ...and B takes it
+    EXPECT_FALSE(has(pb.push, "f"));
+
+    // Both sides must also persist the same survivor, or the next round re-opens
+    // the conflict against divergent baselines.
+    Manifest ma = merged_baseline(base, a, b, oa);
+    Manifest mb = merged_baseline(base, b, a, ob);
+    EXPECT_EQ(ma.fingerprint(), mb.fingerprint());
+    ASSERT_TRUE(ma.find("f"));
+    EXPECT_TRUE(ma.find("f")->same_content(*a.find("f")));
+}
+
+TEST(Diff, IdenticalPreferencePoliciesOnBothSidesCannotConverge) {
+    // Why the handshake refuses this pairing rather than letting it run: with both
+    // peers set to "local" each keeps its own version, so both plan a push, neither
+    // ever pulls, and the two trees stay different forever.
+    Manifest base;
+    base.set("f", fm("v0", 10));
+    Manifest a, b;
+    a.set("f", fm("A", 200));
+    b.set("f", fm("B", 300));
+
+    ReconcileOptions o = two_way();
+    o.conflict = ConflictPolicy::PreferLocal;
+    SyncPlan pa = reconcile(base, a, b, o);
+    SyncPlan pb = reconcile(base, b, a, o);
+
+    EXPECT_TRUE(has(pa.push, "f"));
+    EXPECT_TRUE(has(pb.push, "f"));
+    EXPECT_TRUE(pa.pull.empty());
+    EXPECT_TRUE(pb.pull.empty());
+    // ...and the baselines they would persist disagree, which is the durable half
+    // of the damage.
+    EXPECT_NE(merged_baseline(base, a, b, o).fingerprint(),
+              merged_baseline(base, b, a, o).fingerprint());
+}
+
+TEST(Diff, PolicyNamesMatchTheConflictFlag) {
+    EXPECT_STREQ(conflict_policy_name(ConflictPolicy::Newer), "newer");
+    EXPECT_STREQ(conflict_policy_name(ConflictPolicy::Larger), "larger");
+    EXPECT_STREQ(conflict_policy_name(ConflictPolicy::PreferLocal), "local");
+    EXPECT_STREQ(conflict_policy_name(ConflictPolicy::PreferRemote), "remote");
+}
+
 TEST(Diff, MergedBaselineConverges) {
     Manifest base, local, remote;
     base.set("keep", fm("k"));

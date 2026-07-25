@@ -76,9 +76,16 @@ channel. Both peers behave identically:
    convergence, persists the new baseline, and prints `✓ in sync`.
 
 Conflicts (both sides edited the same file since the last sync) are resolved by a
-deterministic, identical-on-both-peers policy — newest mtime wins by default
-(`--conflict larger|local|remote` to change it) — so both ends always pick the
-same winner.
+deterministic policy — newest mtime wins by default (`--conflict larger|local|remote`
+to change it) — so both ends always pick the same winner.
+
+The two peers must run **complementary** policies. `newer` and `larger` compare the
+two versions themselves, so both sides reach the same verdict from the same setting.
+`local` and `remote` name a *side*, and "local" is a different tree on each peer — so
+they pair with each other: `--conflict local` on the side that should win, `--conflict
+remote` on the other. Two peers both set to `local` would each keep their own version
+and never converge, so rasync refuses that pairing at the handshake instead of
+stalling silently.
 
 ### The delta algorithm
 
@@ -203,7 +210,7 @@ rasync --mirror --replica --peer web.example.com:9000 ./website-backup
 | `--lan` | Discover on the local network only (mDNS). |
 | `--mirror` | One-way mirror instead of two-way merge. |
 | `--source` / `--replica` | Mirror role (the source is authoritative). |
-| `--conflict <policy>` | `newer` (default), `larger`, `local`, or `remote`. |
+| `--conflict <policy>` | `newer` (default), `larger`, `local`, or `remote`. Peers must pair: `newer`/`newer`, `larger`/`larger`, `local`/`remote`. |
 | `--no-delete` | Never delete files — additive sync only. |
 | `--no-delta` | Send whole files instead of rsync deltas. |
 | `--ignore <pattern>` | Exclude paths (gitignore syntax). Repeatable. |
@@ -252,8 +259,12 @@ node_modules/
   (always bounded memory). Everything else streams in fixed windows.
 - **Symlinks and empty directories** are not tracked in this version (regular files
   only).
-- Both peers should run with the **same mode** (`two-way` vs `mirror`) and conflict
-  policy; rasync warns on a mismatch but does not enforce it.
+- Both peers should run with the **same mode** (`two-way` vs `mirror`); rasync warns
+  on a mismatch but does not enforce it. Conflict policies, by contrast, **are**
+  enforced: they must be complementary (`newer`/`newer`, `larger`/`larger`,
+  `local`/`remote`), because a mismatched pair either stalls forever or swaps the two
+  versions back and forth on every round. A peer that offers a non-complementary
+  policy is refused at the handshake, with a message naming the flag to fix it.
 
 ---
 
