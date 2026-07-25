@@ -164,6 +164,54 @@ TEST(SyncIntegration, ModificationPropagatesAsDelta) {
     EXPECT_EQ(0, std::memcmp(got.data(), modified.data(), modified.size()));
 }
 
+// A delta whose literal run exceeds the send window (SyncConfig::window_bytes)
+// makes the sender genuinely block on FileAck, which the small-file delta test
+// above never does. The receiver must ack *wire* bytes: acking the reconstructed
+// size instead counts COPY bytes the sender never sent, so its window counter
+// runs backwards (unsigned) and the sender thread wedges for good.
+TEST(SyncIntegration, LargeDeltaWithCopiesDrainsTheSendWindow) {
+    Endpoint a, b;
+    // The COPY run must outweigh the literals: only then does the receiver's byte
+    // count stay ahead of the sender's for the whole transfer, which is what turns
+    // a mis-scoped ack into a permanently unsatisfiable window.
+    constexpr size_t kPrefix = 8 * 1024 * 1024;  // untouched → one large COPY
+    constexpr size_t kTail   = 6 * 1024 * 1024;  // rewritten → literals past the window
+    const std::string rel = "huge.bin";
+    auto original = test::random_bytes(kPrefix + kTail, 7);
+    test::write_file(a.dir.sub(rel), original);
+
+    // Hashing a 14 MiB tree on every poll would dominate the test, and the final
+    // path only ever gets the new content after verification + atomic rename — so
+    // its size is a sound (and cheap) convergence signal.
+    auto b_size = [&](size_t want) {
+        std::error_code ec;
+        return std::filesystem::file_size(b.dir.sub(rel), ec) == want;
+    };
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] { return b_size(original.size()); }))
+        << "initial whole-file transfer did not converge";
+
+    // Replace everything past the first MiB, and change the length so the
+    // size+mtime quick-check reliably flags the edit.
+    auto modified = original;
+    modified.resize(kPrefix);
+    auto rewritten = test::random_bytes(kTail + 11, 99);
+    modified.insert(modified.end(), rewritten.begin(), rewritten.end());
+    test::write_file(a.dir.sub(rel), modified);
+    a.publish();
+
+    ASSERT_TRUE(wait_until([&] { return b_size(modified.size()); }))
+        << "large delta stalled — the sender never drained its send window";
+
+    std::string got = test::read_file(b.dir.sub(rel));
+    ASSERT_EQ(got.size(), modified.size());
+    EXPECT_EQ(0, std::memcmp(got.data(), modified.data(), modified.size()));
+}
+
 TEST(SyncIntegration, DeletionPropagates) {
     Endpoint a, b;
     test::write_file(a.dir.sub("keep.txt"), "keep");

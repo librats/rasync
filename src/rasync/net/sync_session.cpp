@@ -436,7 +436,11 @@ void SyncSession::window_wait(uint64_t xid) {
     const uint64_t window = service_.config().window_bytes;
     std::unique_lock<std::mutex> lk(send_mtx_);
     send_cv_.wait(lk, [&] {
-        return !running_.load() || cur_xid_ != xid || (cur_sent_ - cur_acked_) <= window;
+        if (!running_.load() || cur_xid_ != xid) return true;
+        // `cur_acked_ >= cur_sent_` means fully drained. Testing it explicitly keeps
+        // an ack that (benignly or maliciously) runs ahead of our own counter from
+        // underflowing the subtraction into a window that can never be satisfied.
+        return cur_acked_ >= cur_sent_ || (cur_sent_ - cur_acked_) <= window;
     });
 }
 
@@ -498,10 +502,13 @@ void SyncSession::handle_file_literal(BinaryReader& r) {
     in->written += data.size();
     in->on_wire += data.size();
 
-    if (in->written - in->last_ack >= kAckInterval) {
-        in->last_ack = in->written;
+    // Ack the bytes that actually crossed the wire — never the reconstructed size.
+    // The sender's window counts literals only, so acking `written` (which includes
+    // COPY bytes it never sent) would run its counter backwards.
+    if (in->on_wire - in->last_ack >= kAckInterval) {
+        in->last_ack = in->on_wire;
         auto w = proto::message(proto::Op::FileAck);
-        w.u64(xid); w.u64(in->written);
+        w.u64(xid); w.u64(in->on_wire);
         send_msg(w);
     }
     if (service_.events().progress)
@@ -573,10 +580,10 @@ void SyncSession::handle_file_end(BinaryReader& r) {
 }
 
 void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
-    // Ack the final byte count so the sender's window drains cleanly.
+    // Ack every wire byte so the sender's window drains cleanly.
     {
         auto w = proto::message(proto::Op::FileAck);
-        w.u64(in->xid); w.u64(in->written);
+        w.u64(in->xid); w.u64(in->on_wire);
         send_msg(w);
     }
     in->out.close();

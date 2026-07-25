@@ -25,7 +25,11 @@
  *   FileLiteral  [u64 xid][blob32 data]        (append literal bytes to the temp)
  *   FileCopy     [u64 xid][u64 base_off][u32 len]   (copy from the receiver's base)
  *   FileEnd      [u64 xid][hash:32]            (whole-file SHA-256 of the result)
- *   FileAck      [u64 xid][u64 bytes_written]  (cumulative; drives send windowing)
+ *   FileAck      [u64 xid][u64 wire_bytes]   (cumulative *literal* bytes received;
+ *                                            drives send windowing. Deliberately not
+ *                                            the reconstructed size — COPY bytes never
+ *                                            crossed the wire, so counting them would
+ *                                            run the sender's window counter backwards.)
  *   NotFound     [str16 path]                  (a requested path is gone)
  *   RequestsDone [u64 round]                   (I've sent every request this round)
  *   Changed      [u64 generation]              (my tree changed — start a round)
