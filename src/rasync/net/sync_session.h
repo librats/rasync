@@ -147,6 +147,12 @@ private:
     librats::PeerId peer_;
     std::string     temp_tag_;   ///< peer-derived prefix that scopes our temp files
 
+    /// Set once the peer turns out to speak a protocol version we cannot read.
+    /// The session then goes inert rather than trading messages neither side can
+    /// parse — see handle_hello for why refusing beats trying. Atomic because it
+    /// gates the reactor's dispatch and the daemon's local_changed() alike.
+    std::atomic<bool>        incompatible_{false};
+
     std::mutex               mtx_;             ///< guards the state below
     Manifest                 remote_;          ///< peer's tree, as described so far
     bool                     have_remote_ = false;

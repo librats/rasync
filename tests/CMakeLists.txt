@@ -23,6 +23,7 @@ add_executable(rasync_core_tests
     test_hash.cpp
     test_manifest.cpp
     test_ignore.cpp
+    test_path.cpp
     test_delta.cpp
     test_diff.cpp
     test_scanner.cpp

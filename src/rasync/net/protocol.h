@@ -40,10 +40,17 @@
  *                                            the reconstructed size — COPY bytes never
  *                                            crossed the wire, so counting them would
  *                                            run the sender's window counter backwards.)
- *   NotFound     [str16 path]                  (a requested path is gone)
+ *   NotFound     [str16 path]                  (a requested path is gone, or refused:
+ *                                            every request is answered, so the asker
+ *                                            can free the pull-window slot it holds)
  *   RequestsDone [u64 round]                   (I've sent every request this round)
  *   Changed      [u64 generation]              (my tree changed — start a round)
- *   Bye          (empty)
+ *   Bye          (empty)                       (the sender will not sync with you —
+ *                                            currently only on a version mismatch)
+ *
+ * A peer whose Hello carries a different kVersion is refused outright: v1 and v2
+ * describe a tree differently, so continuing would mean each side logging a
+ * malformed message per advertisement while never converging.
  */
 
 #include <cstdint>

@@ -4,6 +4,7 @@
 
 #include "core/diff.h"
 #include "core/hash.h"
+#include "core/path.h"
 
 #include <algorithm>
 #include <chrono>
@@ -28,21 +29,22 @@ namespace {
 
 constexpr uint64_t kAckInterval = 256 * 1024;  // receiver acks at least this often
 
-// A peer-supplied relative path is safe only if it stays inside the sync root:
-// non-empty, relative, no drive letter, no "."/".." component, forward slashes.
-bool is_safe_rel(const std::string& p) {
-    if (p.empty() || p.front() == '/' || p.front() == '\\') return false;
-    if (p.find('\\') != std::string::npos) return false;
-    if (p.size() >= 2 && p[1] == ':') return false;  // C:...
-    size_t start = 0;
-    while (start <= p.size()) {
-        size_t slash = p.find('/', start);
-        std::string seg = p.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
-        if (seg == "." || seg == "..") return false;
-        if (slash == std::string::npos) break;
-        start = slash + 1;
-    }
-    return true;
+// Drop the entries of a peer-supplied patch that we must never act on, and report
+// how many went. A patch names files we would create, so a path that could escape
+// the sync root is discarded here — before it reaches `remote_`, is planned as a
+// pull, and then holds one of the few pull-window slots for the rest of the
+// session waiting on a file we would refuse to write anyway. Filtering here and
+// not in the codec is deliberate: the codec also decodes our own baseline off
+// disk, and one unrepresentable path should cost that path, not the whole tree.
+// Removals need no filtering — they can only erase a path that was accepted.
+size_t sanitize(ManifestPatch& patch) {
+    const size_t before = patch.set.size();
+    patch.set.erase(std::remove_if(patch.set.begin(), patch.set.end(),
+                                   [](const std::pair<std::string, FileMeta>& e) {
+                                       return !is_safe_relpath(e.first);
+                                   }),
+                    patch.set.end());
+    return before - patch.set.size();
 }
 
 void set_mtime(const std::string& path, int64_t mtime) {
@@ -134,6 +136,7 @@ void SyncSession::stop() {
 // ── inbound dispatch (reactor thread) ────────────────────────────────────────
 
 void SyncSession::handle(librats::ByteView payload) {
+    if (incompatible_.load()) return;  // nothing this peer says can be acted on
     BinaryReader r(payload.data(), payload.size());
     auto op = static_cast<proto::Op>(r.u8());
     if (!r.ok()) return;
@@ -173,9 +176,21 @@ void SyncSession::handle_hello(BinaryReader& r) {
     r.u64();         // base generation (informational)
     r.str16();       // name
     if (!r.ok()) return;
-    if (version != proto::kVersion)
+    if (version != proto::kVersion) {
+        // Refuse the peer instead of carrying on. The shape of a tree description
+        // changed in v2, so a mismatched peer's updates decode as garbage: both
+        // sides would log a malformed message per advertisement and silently never
+        // converge, which is indistinguishable from a stalled sync. Going inert and
+        // saying so once is the honest outcome. Bye is understood by every version,
+        // so the peer learns of it too.
         service_.log(2, "peer speaks protocol v" + std::to_string(version) +
-                        " (we are v" + std::to_string(proto::kVersion) + ")");
+                        ", we speak v" + std::to_string(proto::kVersion) +
+                        " — not syncing with this peer");
+        incompatible_.store(true);
+        auto w = proto::message(proto::Op::Bye);
+        send_msg(w);
+        return;
+    }
     if (peer_mode != service_.config().mode)
         service_.log(2, "peer sync mode differs from ours — results may be surprising");
     // Bootstrap the exchange: describe our current tree.
@@ -186,6 +201,9 @@ void SyncSession::handle_manifest_update(BinaryReader& r) {
     uint8_t flags = r.u8();
     auto patch = ManifestPatch::decode(r);
     if (!patch || !r.ok()) { service_.log(2, "dropping malformed manifest update"); return; }
+    if (size_t dropped = sanitize(*patch))
+        service_.log(2, "ignoring " + std::to_string(dropped) +
+                        " manifest entry/entries with an unsafe path");
 
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -293,6 +311,7 @@ void SyncSession::send_update_locked(const ManifestPatch& patch, bool reset) {
 }
 
 void SyncSession::local_changed() {
+    if (incompatible_.load()) return;  // describing our tree to it would be noise
     advertise();
     reconcile_and_act();  // our deletions / conflict-winning may create local work too
 }
@@ -458,13 +477,27 @@ void SyncSession::maybe_synced() {
 void SyncSession::handle_request(BinaryReader& r) {
     Serve job;
     job.rel_path = r.str16();
+    if (!r.ok()) return;  // no path to answer to
+
+    // Every request we decline still gets an answer. A silently dropped one leaves
+    // the asking peer holding one of its few pull slots for the rest of the
+    // session, waiting on a reply that is never coming — a handful of those and it
+    // stops requesting anything at all.
+    auto decline = [&](const std::string& why) {
+        service_.log(2, "declining request for " + job.rel_path + ": " + why);
+        auto w = proto::message(proto::Op::NotFound);
+        w.str16(job.rel_path);
+        send_msg(w);
+    };
+
+    if (!is_safe_relpath(job.rel_path)) { decline("unsafe path"); return; }
     job.has_sig = r.u8() != 0;
     if (job.has_sig) {
         auto sig = Signature::decode(r);
-        if (!sig) return;
+        if (!sig) { decline("malformed signature"); return; }
         job.sig = std::move(*sig);
     }
-    if (!r.ok() || !is_safe_rel(job.rel_path)) return;
+    if (!r.ok()) { decline("truncated request"); return; }
     job.xid = next_xid();
 
     std::lock_guard<std::mutex> lk(mtx_);
@@ -648,7 +681,16 @@ void SyncSession::handle_file_start(BinaryReader& r) {
     in->mtime = r.i64();
     in->mode = r.u32();
     in->is_delta = r.u8() != 0;
-    if (!r.ok() || !is_safe_rel(in->rel_path)) return;
+    if (!r.ok()) return;
+    if (!is_safe_relpath(in->rel_path)) {
+        // Unsafe paths are filtered out of the peer's manifest, so we never asked
+        // for this one: the peer is answering with something other than what was
+        // requested. Hand the reservation back regardless — dropping the header in
+        // silence would strand a pull-window slot for the rest of the session.
+        service_.log(2, "refusing unsafe path from peer: " + in->rel_path);
+        abandon_pull(in->rel_path);
+        return;
+    }
 
     in->final_path = service_.abs_path(in->rel_path);
     std::string tmpdir = service_.temp_dir();

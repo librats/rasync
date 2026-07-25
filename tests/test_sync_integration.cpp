@@ -7,11 +7,15 @@
 
 #include "node/node.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 using namespace rasync;
 using namespace std::chrono;
@@ -98,6 +102,58 @@ struct Endpoint {
 
 void connect(Endpoint& from, Endpoint& to) {
     from.node->connect("127.0.0.1", to.port());
+}
+
+// A bare librats node that speaks the rasync channel by hand. An Endpoint can
+// only ever behave itself; these tests need a peer that lies — about the protocol
+// version it speaks, or about the paths its tree contains.
+struct RawPeer {
+    test::TempDir                  dir;
+    std::unique_ptr<librats::Node> node;
+
+    RawPeer() {
+        librats::NodeConfig ncfg;
+        ncfg.listen_port = 0;
+        ncfg.bind_address = "127.0.0.1";
+        ncfg.protocol = kProtocolName;
+        ncfg.data_dir = dir.str();
+        ncfg.enable_network_monitor = false;
+        node = std::make_unique<librats::Node>(ncfg);
+    }
+    ~RawPeer() { if (node) node->stop(); }
+
+    /// Handle inbound rasync messages, opcode already peeled off. Register before start().
+    template <typename Fn>
+    void on_message(Fn fn) {
+        node->on(proto::kChannel, [fn](const librats::Peer& peer, librats::ByteView payload) {
+            BinaryReader r(payload.data(), payload.size());
+            auto op = static_cast<proto::Op>(r.u8());
+            if (r.ok()) fn(peer.id(), op, r);
+        });
+    }
+
+    void send(const librats::PeerId& to, BinaryWriter& w) {
+        node->send(to, proto::kChannel, librats::ByteView(w.buffer()));
+    }
+
+    /// A Hello claiming `version`; everything after it is what an honest peer sends.
+    void say_hello(const librats::PeerId& to, uint8_t version) {
+        auto w = proto::message(proto::Op::Hello);
+        w.u8(version);
+        w.u8(static_cast<uint8_t>(SyncMode::TwoWay));
+        w.u8(static_cast<uint8_t>(ConflictPolicy::Newer));
+        w.u64(0);
+        w.str16("raw-peer");
+        send(to, w);
+    }
+};
+
+FileMeta meta_of(const std::string& content, int64_t mtime = 1000) {
+    FileMeta m;
+    m.size = content.size();
+    m.mtime = mtime;
+    m.hash = sha256(content);
+    return m;
 }
 
 } // namespace
@@ -356,6 +412,83 @@ TEST(SyncIntegration, LargeManifestUpdatesAreChunkedAndReassembled) {
     // Nothing was lost to a partially applied view.
     EXPECT_TRUE(disk_state(b.root).contains("only_on_b.txt"));
     EXPECT_TRUE(disk_state(a.root).contains("only_on_b.txt"));
+}
+
+TEST(SyncIntegration, PeerWithAnIncompatibleProtocolVersionIsRefused) {
+    // v1 and v2 describe a tree differently, so a mismatched pair that keeps
+    // talking just logs a malformed message per advertisement and never
+    // converges. The session must say Bye once and go inert instead.
+    Endpoint a;
+    test::write_file(a.dir.sub("a.txt"), "content");
+    a.start();
+
+    std::atomic<int> byes{0};
+    std::atomic<int> updates{0};
+    RawPeer peer;
+    peer.on_message([&](const librats::PeerId& from, proto::Op op, BinaryReader&) {
+        switch (op) {
+            case proto::Op::Hello:          peer.say_hello(from, /*version=*/1); break;
+            case proto::Op::Bye:            byes.fetch_add(1); break;
+            case proto::Op::ManifestUpdate: updates.fetch_add(1); break;
+            default: break;
+        }
+    });
+    ASSERT_TRUE(peer.node->start());
+    peer.node->connect("127.0.0.1", a.port());
+
+    ASSERT_TRUE(wait_until([&] { return byes.load() > 0; }, milliseconds(10000)))
+        << "the mismatched peer was never told the session is off";
+
+    // And A must not describe a tree the peer provably cannot read.
+    std::this_thread::sleep_for(milliseconds(300));
+    EXPECT_EQ(updates.load(), 0) << "A advertised to an incompatible peer";
+    EXPECT_EQ(a.svc->advert_messages(), 0u);
+    EXPECT_EQ(byes.load(), 1) << "refusal announced more than once";
+}
+
+TEST(SyncIntegration, UnsafePeerPathsNeverEnterThePullWindow) {
+    // A path that would escape the sync root has to be dropped where the peer's
+    // tree is applied. Reaching the pull queue is already too late: we would
+    // request a file we then refuse to write, and the reservation would hold one
+    // of the few pull-window slots for the rest of the session.
+    Endpoint a;
+    a.start();
+
+    std::mutex               mtx;
+    std::vector<std::string> requested;
+    RawPeer peer;
+    peer.on_message([&](const librats::PeerId& from, proto::Op op, BinaryReader& r) {
+        if (op == proto::Op::Hello) {
+            peer.say_hello(from, proto::kVersion);
+
+            ManifestPatch patch;
+            patch.set.emplace_back("../rasync-escaped-a.txt", meta_of("escaped"));
+            patch.set.emplace_back("sub/../../rasync-escaped-b.txt", meta_of("escaped too"));
+            patch.set.emplace_back("ok.txt", meta_of("legitimate"));
+            auto w = proto::message(proto::Op::ManifestUpdate);
+            w.u8(proto::kUpdateReset);
+            patch.encode(w);
+            peer.send(from, w);
+        } else if (op == proto::Op::Request) {
+            std::lock_guard<std::mutex> lk(mtx);
+            requested.push_back(r.str16());
+        }
+    });
+    ASSERT_TRUE(peer.node->start());
+    peer.node->connect("127.0.0.1", a.port());
+
+    ASSERT_TRUE(wait_until([&] {
+        std::lock_guard<std::mutex> lk(mtx);
+        return !requested.empty();
+    }, milliseconds(10000))) << "the legitimate file was never requested";
+
+    // Give any further request time to show up before concluding there is none.
+    std::this_thread::sleep_for(milliseconds(300));
+    std::lock_guard<std::mutex> lk(mtx);
+    EXPECT_EQ(requested.size(), 1u);
+    EXPECT_EQ(requested.front(), "ok.txt");
+    EXPECT_FALSE(std::filesystem::exists(a.dir.sub("../rasync-escaped-a.txt")));
+    EXPECT_FALSE(std::filesystem::exists(a.dir.sub("../rasync-escaped-b.txt")));
 }
 
 TEST(SyncIntegration, MirrorReplicaFollowsSource) {
