@@ -263,14 +263,23 @@ int run_daemon(const Options& opt) {
         if (now - last_rescan < interval) continue;
         last_rescan = now;
 
+        // Scan against the service's view, not a private copy: it already holds
+        // the files the sessions received since the last pass, so their hashes
+        // are reused instead of the whole download being read back off disk.
+        Manifest before = service.local_manifest();
         ScanStats s;
-        Manifest fresh = scanner.scan(root_str, &current, &s);
-        if (fresh.fingerprint() != current.fingerprint()) {
-            current = std::move(fresh);
+        Manifest fresh = scanner.scan(root_str, &before, &s);
+
+        // Publish the difference rather than the snapshot. A file that landed
+        // while this scan was walking appears in neither endpoint, so it keeps
+        // the entry its transfer recorded instead of being dropped and re-pulled.
+        ManifestPatch patch = diff_manifests(before, fresh);
+        if (!patch.empty()) {
             if (verbosity >= 2)
-                line(term::dim("rescan: ") + std::to_string(current.size()) + " files, " +
+                line(term::dim("rescan: ") + std::to_string(fresh.size()) + " files, " +
+                     std::to_string(patch.size()) + " changed, " +
                      std::to_string(s.files_hashed) + " (re)hashed");
-            service.set_local_manifest(current);
+            service.apply_local_patch(patch);
         }
     }
 

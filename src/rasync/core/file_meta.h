@@ -32,6 +32,15 @@ struct FileMeta {
     bool same_content(const FileMeta& o) const noexcept {
         return size == o.size && hash == o.hash;
     }
+
+    /// Byte-identical metadata. Stricter than `same_content` on purpose: this is
+    /// what decides whether an entry has to travel in a manifest patch, and the
+    /// peer must end up with *exactly* our entry (mtime drives conflict
+    /// resolution, mode is part of the manifest fingerprint).
+    bool operator==(const FileMeta& o) const noexcept {
+        return size == o.size && mtime == o.mtime && mode == o.mode && hash == o.hash;
+    }
+    bool operator!=(const FileMeta& o) const noexcept { return !(*this == o); }
 };
 
 } // namespace rasync

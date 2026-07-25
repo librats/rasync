@@ -16,6 +16,7 @@
  * directly.
  */
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -25,6 +26,7 @@
 #include "core/diff.h"
 #include "core/manifest.h"
 #include "core/delta.h"
+#include "net/protocol.h"
 
 #include "node/node.h"
 #include "peer/peer_id.h"
@@ -50,6 +52,18 @@ struct SyncConfig {
     uint32_t chunk_size       = 64 * 1024;                  ///< whole-file / literal chunk payload
     uint64_t window_bytes     = 4ull * 1024 * 1024;         ///< max un-acked bytes in flight
     uint64_t delta_max_bytes  = 256ull * 1024 * 1024;       ///< above this, skip delta (bounded memory)
+
+    /// How many pulls may be requested at once. Requests are not free: each one
+    /// carries an rsync signature (~1% of the file) and parks it on the peer's
+    /// serve queue, so asking for a whole plan at once can both exhaust memory
+    /// and overrun the transport's send high-water mark. The serve side is
+    /// serial anyway — a handful in flight is enough to keep it busy.
+    uint32_t max_pending_pulls = 8;
+
+    /// Largest ManifestUpdate message to put on the wire; bigger updates are
+    /// split into chunks the receiver reassembles. Configurable so the chunking
+    /// path can be exercised without building a million-file tree.
+    size_t   max_update_bytes = proto::kMaxUpdateBytes;
 };
 
 /// One in-flight or just-finished file transfer, for the UI.
@@ -96,9 +110,17 @@ public:
     /// node.start() — it is unconditional, so it must not race a live transfer.
     void clean_temp_dir();
 
-    /// Replace the current local manifest (called by the daemon after each scan)
-    /// and nudge every session to re-sync if it changed.
+    /// Replace the current local manifest wholesale and nudge every session.
+    /// Used for the first scan; afterwards prefer apply_local_patch, which does
+    /// not discard mutations the sessions made while the scan was running.
     void set_local_manifest(Manifest m);
+
+    /// Fold a scan's findings into the local manifest and nudge every session.
+    /// Only the paths the scan actually saw change are touched, so a file that
+    /// landed mid-scan (and is therefore in neither of the scan's endpoints)
+    /// keeps the entry the transfer recorded instead of being forgotten and
+    /// pulled a second time.
+    void apply_local_patch(const ManifestPatch& patch);
 
     /// Stop and drop all sessions (called before node.stop()).
     void shutdown();
@@ -109,6 +131,19 @@ public:
     Manifest local_manifest() const;
     Manifest base_manifest()  const;
     void     set_base_manifest(const Manifest& m);   ///< also persists to disk
+
+    /// Bumped on every mutation of the local or baseline manifest. Comparing it
+    /// is O(1), which lets a session skip a full reconcile when nothing can have
+    /// changed since the last one — the alternative is re-deciding the whole tree
+    /// after every single transferred file.
+    uint64_t manifest_version() const noexcept { return manifest_version_.load(); }
+
+    /// Manifest-advertisement traffic produced so far (messages, encoded bytes).
+    /// Exposed because "how much bookkeeping did a sync cost?" is the property
+    /// incremental updates exist to bound — and the one worth a regression test.
+    uint64_t advert_messages() const noexcept { return advert_messages_.load(); }
+    uint64_t advert_bytes()    const noexcept { return advert_bytes_.load(); }
+    void     note_advert_sent(size_t bytes);
 
     /// Apply a locally-observed mutation to the tracked local manifest (so the
     /// session's next reconcile sees convergence without waiting for a rescan).
@@ -124,15 +159,22 @@ private:
     void on_peer_up(const librats::PeerId& id);
     void on_peer_down(const librats::PeerId& id);
     void on_message(const librats::PeerId& from, librats::ByteView payload);
+    void notify_sessions();   ///< tell every session the local tree moved
     std::shared_ptr<SyncSession> session_for(const librats::PeerId& id);
 
     librats::Node&   node_;
     SyncConfig       config_;
     SyncEvents       events_;
 
-    mutable std::mutex manifest_mutex_;
-    Manifest           local_;
-    Manifest           base_;
+    // Lock order, where both are held: a session's own mutex first, then this one.
+    // Nothing here calls back into a session while holding it.
+    mutable std::mutex    manifest_mutex_;
+    Manifest              local_;
+    Manifest              base_;
+    std::atomic<uint64_t> manifest_version_{0};
+
+    std::atomic<uint64_t> advert_messages_{0};
+    std::atomic<uint64_t> advert_bytes_{0};
 
     std::mutex sessions_mutex_;
     std::unordered_map<librats::PeerId, std::shared_ptr<SyncSession>, librats::PeerId::Hash> sessions_;

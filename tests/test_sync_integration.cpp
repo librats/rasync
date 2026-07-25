@@ -44,18 +44,21 @@ struct Endpoint {
     test::TempDir dir;
     std::string   root;
     SyncConfig    cfg;
+    std::atomic<int>               synced_events{0};
     std::unique_ptr<librats::Node> node;
     std::unique_ptr<SyncService>   svc;
     Scanner       scanner;
     Manifest      current;
 
-    explicit Endpoint(SyncMode mode = SyncMode::TwoWay, bool source = false)
+    explicit Endpoint(SyncMode mode = SyncMode::TwoWay, bool source = false,
+                      size_t max_update_bytes = 0)
         : scanner(make_ignore()) {
         root = dir.str();
         cfg.root = root;
         cfg.data_dir = dir.sub(".rasync");
         cfg.mode = mode;
         cfg.source = source;
+        if (max_update_bytes) cfg.max_update_bytes = max_update_bytes;
 
         librats::NodeConfig ncfg;
         ncfg.listen_port = 0;
@@ -64,7 +67,13 @@ struct Endpoint {
         ncfg.data_dir = cfg.data_dir;
         ncfg.enable_network_monitor = false;
         node = std::make_unique<librats::Node>(ncfg);
-        svc = std::make_unique<SyncService>(*node, cfg);
+
+        // Fires from reactor/session threads once a peer's tree matches ours.
+        SyncEvents ev;
+        ev.synced = [this](const librats::PeerId&, uint64_t, uint64_t) {
+            synced_events.fetch_add(1);
+        };
+        svc = std::make_unique<SyncService>(*node, cfg, ev);
         svc->attach();
     }
 
@@ -266,6 +275,87 @@ TEST(SyncIntegration, TempFilesDoNotOutliveTheTransfer) {
     std::error_code ec;
     for (auto& e : std::filesystem::directory_iterator(b.dir.sub(kTempDirName), ec))
         ADD_FAILURE() << "leftover temp file: " << e.path().string();
+}
+
+TEST(SyncIntegration, ManifestTrafficStaysProportionalToChanges) {
+    Endpoint a, b;
+    constexpr int kFiles = 120;
+    for (int i = 0; i < kFiles; ++i)
+        test::write_file(a.dir.sub("f" + std::to_string(i) + ".txt"),
+                         "payload " + std::to_string(i));
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        return disk_state(b.root).size() == kFiles &&
+               disk_state(a.root).fingerprint() == disk_state(b.root).fingerprint();
+    })) << "files did not sync";
+
+    // B pulled 120 files. Describing its tree once per received file — the
+    // behaviour incremental updates replaced — costs ~121 messages and ~435 KB.
+    // Two are enough: the opening reset, and one coalesced update once the
+    // inbound queue drained (measured: 2 messages, ~7 KB).
+    EXPECT_LE(b.svc->advert_messages(), 4u)
+        << "B re-described its tree far more often than it changed";
+    EXPECT_LT(b.svc->advert_bytes(), 32u * 1024)
+        << "manifest bookkeeping grew with the tree, not with the changes";
+
+    // A's tree never changed, so after the opening description it says nothing.
+    EXPECT_LE(a.svc->advert_messages(), 2u);
+}
+
+TEST(SyncIntegration, ConvergenceIsAnnouncedAndBaselinePersisted) {
+    // Convergence is now decided behind an O(1) "did anything move?" gate, and
+    // `--once` plus two-way delete propagation both hang off this event and the
+    // baseline it writes — so both are worth pinning down.
+    Endpoint a, b;
+    test::write_file(a.dir.sub("one.txt"), "1");
+    test::write_file(a.dir.sub("two.txt"), "2");
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        return a.synced_events.load() > 0 && b.synced_events.load() > 0;
+    })) << "neither side ever announced convergence";
+
+    EXPECT_TRUE(std::filesystem::exists(b.dir.sub(".rasync/baseline.man")))
+        << "no baseline persisted — deletes could not propagate on the next run";
+
+    // Nothing changed afterwards, so nothing re-announces it.
+    const int seen = b.synced_events.load();
+    std::this_thread::sleep_for(milliseconds(400));
+    EXPECT_EQ(b.synced_events.load(), seen) << "convergence announced repeatedly";
+}
+
+TEST(SyncIntegration, LargeManifestUpdatesAreChunkedAndReassembled) {
+    // A's updates are capped absurdly low, so even a handful of files has to go
+    // out as several kUpdateMore chunks. The receiver must hold them all back and
+    // apply them at once — a half-applied tree reads as "the peer deleted the
+    // rest", which would propagate as deletions.
+    Endpoint a(SyncMode::TwoWay, false, /*max_update_bytes=*/80);
+    Endpoint b;
+    for (int i = 0; i < 6; ++i)
+        test::write_file(a.dir.sub("chunk" + std::to_string(i) + ".txt"), "c");
+    test::write_file(b.dir.sub("only_on_b.txt"), "b");
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        Manifest da = disk_state(a.root), db = disk_state(b.root);
+        return da.size() == 7 && db.size() == 7 && da.fingerprint() == db.fingerprint();
+    })) << "chunked manifest update did not converge";
+
+    // The cap really did split the description into several messages.
+    EXPECT_GE(a.svc->advert_messages(), 3u);
+    // Nothing was lost to a partially applied view.
+    EXPECT_TRUE(disk_state(b.root).contains("only_on_b.txt"));
+    EXPECT_TRUE(disk_state(a.root).contains("only_on_b.txt"));
 }
 
 TEST(SyncIntegration, MirrorReplicaFollowsSource) {

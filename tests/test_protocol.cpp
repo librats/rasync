@@ -35,20 +35,51 @@ TEST(Protocol, HelloRoundTrip) {
     EXPECT_TRUE(r.ok());
 }
 
-TEST(Protocol, ManifestMessageRoundTrip) {
-    Manifest m;
+namespace {
+/// Decode one ManifestUpdate message into (flags, patch), as a receiver would.
+std::pair<uint8_t, ManifestPatch> read_update(const Bytes& msg) {
+    BinaryReader r(msg);
+    EXPECT_EQ(static_cast<proto::Op>(r.u8()), proto::Op::ManifestUpdate);
+    uint8_t flags = r.u8();
+    auto patch = ManifestPatch::decode(r);
+    EXPECT_TRUE(patch.has_value());
+    EXPECT_TRUE(r.ok());
+    return {flags, patch.value_or(ManifestPatch{})};
+}
+} // namespace
+
+TEST(Protocol, ManifestUpdateRoundTrip) {
     FileMeta fm; fm.size = 3; fm.mtime = 9; fm.hash = sha256("abc");
-    m.set("a/b.txt", fm);
+    Manifest tree;
+    tree.set("a/b.txt", fm);
 
-    auto w = proto::message(proto::Op::Manifest);
-    m.encode(w);
+    // The first update of a session: a reset carrying the whole tree, because the
+    // receiver has no view of us to difference against yet.
+    ManifestPatch full;
+    for (const auto& [path, meta] : tree.entries()) full.set.emplace_back(path, meta);
+    auto w = proto::message(proto::Op::ManifestUpdate);
+    w.u8(proto::kUpdateReset);
+    full.encode(w);
 
-    BinaryReader r(w.buffer());
-    EXPECT_EQ(static_cast<proto::Op>(r.u8()), proto::Op::Manifest);
-    auto back = Manifest::decode(r);
-    ASSERT_TRUE(back.has_value());
-    ASSERT_NE(back->find("a/b.txt"), nullptr);
-    EXPECT_EQ(back->find("a/b.txt")->hash, fm.hash);
+    auto [flags, patch] = read_update(w.buffer());
+    EXPECT_EQ(flags, proto::kUpdateReset);
+    Manifest view;  // the receiver starts from empty on a reset
+    view.apply(patch);
+    EXPECT_EQ(view.fingerprint(), tree.fingerprint());
+
+    // Every later update is a difference against that same view.
+    Manifest next = tree;
+    next.remove("a/b.txt");
+    next.set("c.txt", fm);
+    auto w2 = proto::message(proto::Op::ManifestUpdate);
+    w2.u8(0);
+    diff_manifests(tree, next).encode(w2);
+
+    auto [flags2, patch2] = read_update(w2.buffer());
+    EXPECT_EQ(flags2, 0);
+    view.apply(patch2);
+    EXPECT_EQ(view.fingerprint(), next.fingerprint());
+    EXPECT_FALSE(view.contains("a/b.txt"));
 }
 
 TEST(Protocol, RequestWithSignatureRoundTrip) {

@@ -4,8 +4,8 @@ namespace rasync::proto {
 
 const char* op_name(Op op) {
     switch (op) {
-        case Op::Hello:        return "Hello";
-        case Op::Manifest:     return "Manifest";
+        case Op::Hello:          return "Hello";
+        case Op::ManifestUpdate: return "ManifestUpdate";
         case Op::Request:      return "Request";
         case Op::FileStart:    return "FileStart";
         case Op::FileLiteral:  return "FileLiteral";

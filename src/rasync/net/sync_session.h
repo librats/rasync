@@ -11,11 +11,24 @@
  * thread (so large reads/sends never block the librats reactor). Files it already
  * has an older copy of are pulled as rsync deltas.
  *
+ * Two things keep the session's cost proportional to what *changed* rather than
+ * to the size of the tree, which is what makes a large tree workable at all:
+ *
+ *  - **Advertisements are incremental.** `last_sent_` is the tree as the peer
+ *    last saw it; every advertisement ships the diff against it. Receiving a file
+ *    only marks the session dirty — the update is coalesced and flushed once the
+ *    inbound queue drains, instead of re-describing the whole tree N times.
+ *  - **Pulls are windowed.** A plan may name a million paths; only
+ *    `max_pending_pulls` are requested at a time, and the requester thread builds
+ *    their rsync signatures off the reactor.
+ *
  * Threading: protocol messages and control calls arrive on the reactor thread and
- * mutate state under `mtx_`. A single sender thread drains the serve queue; it
- * honours a byte window (FileAck) via `send_cv_`. Incoming file writes happen on
- * the reactor thread into a temp file, verified by SHA-256 and atomically renamed
- * into place on FileEnd.
+ * mutate state under `mtx_`. A sender thread drains the serve queue, honouring a
+ * byte window (FileAck) via `send_cv_`; a requester thread drains the pull queue,
+ * where each request costs a full read of our copy of the file. Incoming file
+ * writes happen on the reactor thread into a temp file, verified by SHA-256 and
+ * atomically renamed into place on FileEnd. Where a session lock and the
+ * service's manifest lock are both needed, `mtx_` is always taken first.
  */
 
 #include <atomic>
@@ -89,7 +102,7 @@ private:
 
     // message handlers
     void handle_hello(BinaryReader& r);
-    void handle_manifest(BinaryReader& r);
+    void handle_manifest_update(BinaryReader& r);
     void handle_request(BinaryReader& r);
     void handle_file_start(BinaryReader& r);
     void handle_file_literal(BinaryReader& r);
@@ -100,9 +113,17 @@ private:
 
     // reconciliation
     void send_hello();
-    void send_manifest_if_changed();
-    void reconcile_and_act();       ///< the round: delete + request, under mtx_
+    void advertise();               ///< ship whatever the peer hasn't heard yet
+    void advertise_locked();        ///< …with mtx_ already held (keeps updates ordered)
+    void send_update_locked(const ManifestPatch& patch, bool reset);
+    void reconcile_and_act();       ///< the round: delete + queue pulls
     void maybe_synced();            ///< emit "in sync" + persist baseline at quiescence
+
+    // pulling (requester thread)
+    void requester_loop();
+    void send_request(const std::string& rel_path);
+    bool may_request_locked() const;  ///< a queued pull and a free window slot
+    void release_pull(const std::string& rel_path);  ///< done with a path; frees a slot
 
     // serving (sender thread)
     void sender_loop();
@@ -113,7 +134,6 @@ private:
     void note_sent(uint64_t xid, uint64_t bytes);
 
     // helpers
-    void abandon_pull(const std::string& rel_path);  ///< release a path we can't receive
     void finalize_incoming(const std::shared_ptr<Incoming>& in);
     void fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why);
     void send_msg(BinaryWriter& w);
@@ -124,15 +144,35 @@ private:
     std::string     temp_tag_;   ///< peer-derived prefix that scopes our temp files
 
     std::mutex               mtx_;             ///< guards the state below
-    Manifest                 remote_;          ///< peer's last-advertised manifest
+    Manifest                 remote_;          ///< peer's tree, as described so far
     bool                     have_remote_ = false;
-    Hash                     last_sent_fp_{};   ///< fingerprint of the manifest we last sent
+    uint64_t                 remote_version_ = 0;  ///< bumped when remote_ changes
+    Manifest                 staging_;         ///< a multi-chunk update being assembled
+    bool                     staging_active_ = false;
+
+    Manifest                 last_sent_;       ///< our tree as the peer last saw it
     bool                     last_sent_valid_ = false;
+    uint64_t                 last_sent_version_ = 0;  ///< manifest version behind last_sent_
+    bool                     advertise_pending_ = false;  ///< owed an update once inbound work drains
+
     Hash                     last_synced_fp_{}; ///< suppress duplicate "in sync" events
     bool                     last_synced_valid_ = false;
+    /// Manifest versions at the last convergence check. Re-running the check
+    /// against unchanged inputs would just re-derive the same answer over the
+    /// whole tree, and it is asked after every single transferred file.
+    uint64_t                 last_eval_local_ver_ = 0;
+    uint64_t                 last_eval_remote_ver_ = 0;
+    bool                     last_eval_valid_ = false;
 
-    std::unordered_set<std::string>                       pulling_;   ///< paths requested, not yet done
+    /// Paths this side is responsible for pulling: every one of them is either
+    /// still in `pull_queue_` or has been requested and is awaiting data. The
+    /// difference of the two sizes is what is in flight.
+    std::unordered_set<std::string>                       pulling_;
+    std::deque<std::string>                               pull_queue_;
     std::unordered_map<uint64_t, std::shared_ptr<Incoming>> incoming_;
+
+    std::thread              requester_;
+    std::condition_variable  pull_cv_;          ///< wakes the requester: new pulls / free slot
 
     // sender thread + serve queue
     std::thread              sender_;

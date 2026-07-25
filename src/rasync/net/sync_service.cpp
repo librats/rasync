@@ -31,6 +31,7 @@ void SyncService::load_baseline() {
     if (auto m = Manifest::load(path)) {
         std::lock_guard<std::mutex> lk(manifest_mutex_);
         base_ = std::move(*m);
+        manifest_version_.fetch_add(1);
         log(0, "loaded baseline with " + std::to_string(base_.size()) + " entries");
     }
 }
@@ -57,6 +58,7 @@ void SyncService::set_base_manifest(const Manifest& m) {
     // multiple peers) can't interleave writes to the same baseline file.
     std::lock_guard<std::mutex> lk(manifest_mutex_);
     base_ = m;
+    manifest_version_.fetch_add(1);
     librats::create_directories(config_.data_dir.c_str());
     m.save(librats::combine_paths(config_.data_dir, "baseline.man"));
 }
@@ -64,19 +66,42 @@ void SyncService::set_base_manifest(const Manifest& m) {
 void SyncService::note_local_set(const std::string& path, const FileMeta& meta) {
     std::lock_guard<std::mutex> lk(manifest_mutex_);
     local_.set(path, meta);
+    manifest_version_.fetch_add(1);
 }
 
 void SyncService::note_local_removed(const std::string& path) {
     std::lock_guard<std::mutex> lk(manifest_mutex_);
     local_.remove(path);
+    manifest_version_.fetch_add(1);
+}
+
+void SyncService::note_advert_sent(size_t bytes) {
+    advert_messages_.fetch_add(1);
+    advert_bytes_.fetch_add(bytes);
 }
 
 void SyncService::set_local_manifest(Manifest m) {
     {
         std::lock_guard<std::mutex> lk(manifest_mutex_);
         local_ = std::move(m);
+        manifest_version_.fetch_add(1);
     }
-    // Fan out to every session so it re-advertises and reconciles.
+    notify_sessions();
+}
+
+void SyncService::apply_local_patch(const ManifestPatch& patch) {
+    if (patch.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(manifest_mutex_);
+        local_.apply(patch);
+        manifest_version_.fetch_add(1);
+    }
+    notify_sessions();
+}
+
+void SyncService::notify_sessions() {
+    // Never call into a session while holding manifest_mutex_: a session takes
+    // its own lock first and this one second, so the reverse order would deadlock.
     std::vector<std::shared_ptr<SyncSession>> sessions;
     {
         std::lock_guard<std::mutex> lk(sessions_mutex_);

@@ -95,16 +95,23 @@ void SyncSession::start() {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) return;
     sender_ = std::thread([this] { sender_loop(); });
+    requester_ = std::thread([this] { requester_loop(); });
     send_hello();
 }
 
 void SyncSession::stop() {
     if (!running_.exchange(false)) return;
-    { std::lock_guard<std::mutex> lk(mtx_); queue_cv_.notify_all(); }
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        queue_cv_.notify_all();
+        pull_cv_.notify_all();
+    }
     { std::lock_guard<std::mutex> lk(send_mtx_); send_cv_.notify_all(); }
     if (sender_.joinable()) sender_.join();
+    if (requester_.joinable()) requester_.join();
     std::lock_guard<std::mutex> lk(mtx_);
     incoming_.clear();  // Incoming dtor drops temp files
+    pull_queue_.clear();
 }
 
 // ── inbound dispatch (reactor thread) ────────────────────────────────────────
@@ -114,8 +121,8 @@ void SyncSession::handle(librats::ByteView payload) {
     auto op = static_cast<proto::Op>(r.u8());
     if (!r.ok()) return;
     switch (op) {
-        case proto::Op::Hello:        handle_hello(r); break;
-        case proto::Op::Manifest:     handle_manifest(r); break;
+        case proto::Op::Hello:          handle_hello(r); break;
+        case proto::Op::ManifestUpdate: handle_manifest_update(r); break;
         case proto::Op::Request:      handle_request(r); break;
         case proto::Op::FileStart:    handle_file_start(r); break;
         case proto::Op::FileLiteral:  handle_file_literal(r); break;
@@ -123,7 +130,7 @@ void SyncSession::handle(librats::ByteView payload) {
         case proto::Op::FileEnd:      handle_file_end(r); break;
         case proto::Op::FileAck:      handle_file_ack(r); break;
         case proto::Op::NotFound:     handle_not_found(r); break;
-        case proto::Op::Changed:      send_manifest_if_changed(); break;
+        case proto::Op::Changed:      advertise(); break;
         case proto::Op::RequestsDone: maybe_synced(); break;
         case proto::Op::Bye:          break;
     }
@@ -154,39 +161,122 @@ void SyncSession::handle_hello(BinaryReader& r) {
                         " (we are v" + std::to_string(proto::kVersion) + ")");
     if (peer_mode != service_.config().mode)
         service_.log(2, "peer sync mode differs from ours — results may be surprising");
-    // Bootstrap the exchange: advertise our current tree.
-    send_manifest_if_changed();
+    // Bootstrap the exchange: describe our current tree.
+    advertise();
 }
 
-void SyncSession::handle_manifest(BinaryReader& r) {
-    auto m = Manifest::decode(r);
-    if (!m) { service_.log(2, "dropping malformed manifest"); return; }
+void SyncSession::handle_manifest_update(BinaryReader& r) {
+    uint8_t flags = r.u8();
+    auto patch = ManifestPatch::decode(r);
+    if (!patch || !r.ok()) { service_.log(2, "dropping malformed manifest update"); return; }
+
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        remote_ = std::move(*m);
+        if (flags & proto::kUpdateReset) {
+            staging_ = Manifest{};      // a fresh description of the peer's whole tree
+            staging_active_ = true;
+        }
+        if (staging_active_) {
+            staging_.apply(*patch);
+            // A partially applied tree must never reach reconcile: the paths that
+            // haven't arrived yet would look exactly like paths the peer deleted.
+            if (flags & proto::kUpdateMore) return;
+            remote_ = std::move(staging_);
+            staging_ = Manifest{};
+            staging_active_ = false;
+        } else if (flags & proto::kUpdateMore) {
+            staging_ = remote_;         // multi-chunk increment: assemble aside
+            staging_active_ = true;
+            staging_.apply(*patch);
+            return;
+        } else {
+            remote_.apply(*patch);      // the common case: one small chunk, applied in place
+        }
         have_remote_ = true;
+        ++remote_version_;
     }
     reconcile_and_act();
 }
 
 // ── advertising + reconciliation ─────────────────────────────────────────────
 
-void SyncSession::send_manifest_if_changed() {
-    Manifest local = service_.local_manifest();
-    Hash fp = local.fingerprint();
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (last_sent_valid_ && fp == last_sent_fp_) return;  // nothing new to advertise
-        last_sent_fp_ = fp;
-        last_sent_valid_ = true;
+void SyncSession::advertise() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    advertise_locked();
+}
+
+void SyncSession::advertise_locked() {
+    // Everything about an advertisement happens under mtx_: the diff is taken
+    // against `last_sent_` and immediately becomes the new `last_sent_`, so two
+    // threads advertising at once cannot emit patches that overlap or invert.
+    //
+    // Most calls have nothing to say (every convergence check asks). Settle that
+    // against an O(1) counter before copying a manifest to diff against.
+    const uint64_t version = service_.manifest_version();
+    if (last_sent_valid_ && version == last_sent_version_) {
+        advertise_pending_ = false;
+        return;
     }
-    auto w = proto::message(proto::Op::Manifest);
-    local.encode(w);
-    send_msg(w);
+    last_sent_version_ = version;
+
+    Manifest local = service_.local_manifest();
+
+    ManifestPatch patch;
+    const bool reset = !last_sent_valid_;
+    if (reset) {
+        patch.set.reserve(local.size());
+        for (const auto& [path, meta] : local.entries()) patch.set.emplace_back(path, meta);
+    } else {
+        patch = diff_manifests(last_sent_, local);
+        if (patch.empty()) { advertise_pending_ = false; return; }
+    }
+
+    send_update_locked(patch, reset);
+    last_sent_ = std::move(local);
+    last_sent_valid_ = true;
+    advertise_pending_ = false;
+}
+
+void SyncSession::send_update_locked(const ManifestPatch& patch, bool reset) {
+    ManifestPatch chunk;
+    size_t est = 0;
+    bool   first = true;
+
+    auto flush = [&](bool more) {
+        uint8_t flags = 0;
+        if (first && reset) flags |= proto::kUpdateReset;
+        if (more)           flags |= proto::kUpdateMore;
+        auto w = proto::message(proto::Op::ManifestUpdate);
+        w.u8(flags);
+        chunk.encode(w);
+        service_.note_advert_sent(w.size());
+        send_msg(w);
+        first = false;
+        chunk = ManifestPatch{};
+        est = 0;
+    };
+
+    // Entry sizes vary (paths are length-prefixed), so pace by estimated bytes
+    // rather than by count: a few very long paths must not build a huge message.
+    constexpr size_t kFixedEntryBytes = 54;  // str16 header + size + mtime + mode + hash
+    const size_t cap = service_.config().max_update_bytes;
+    for (const auto& e : patch.set) {
+        chunk.set.push_back(e);
+        est += kFixedEntryBytes + e.first.size();
+        if (est >= cap) flush(/*more=*/true);
+    }
+    for (const auto& path : patch.removed) {
+        chunk.removed.push_back(path);
+        est += 2 + path.size();
+        if (est >= cap) flush(/*more=*/true);
+    }
+    // Always emit a final chunk, even an empty one: it is what commits the update
+    // (and what tells a peer with a reset flag that our tree is simply empty).
+    flush(/*more=*/false);
 }
 
 void SyncSession::local_changed() {
-    send_manifest_if_changed();
+    advertise();
     reconcile_and_act();  // our deletions / conflict-winning may create local work too
 }
 
@@ -220,49 +310,103 @@ void SyncSession::reconcile_and_act() {
         service_.log(0, "deleted " + path);
     }
 
-    // 2. Request the files we need (with a signature when we can delta).
-    for (const auto& path : plan.pull) {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (!pulling_.insert(path).second) continue;  // already requested
-        }
-        auto w = proto::message(proto::Op::Request);
-        w.str16(path);
+    // 2. Reserve the files we need. The requester thread paces the actual
+    //    Requests: a plan can name the whole tree, and every request carries a
+    //    signature the peer has to hold until it serves us.
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (const auto& path : plan.pull)
+            if (pulling_.insert(path).second) pull_queue_.push_back(path);
+    }
+    pull_cv_.notify_all();
 
-        const FileMeta* have = local.find(path);
-        std::string abs = service_.abs_path(path);
-        bool sent_sig = false;
-        if (cfg.use_delta && have && have->size <= cfg.delta_max_bytes &&
-            librats::file_exists(abs)) {
+    if (mutated) advertise();  // tell the peer our tree shrank
+    maybe_synced();
+}
+
+// ── pulling: windowed requests (requester thread) ────────────────────────────
+
+bool SyncSession::may_request_locked() const {
+    if (pull_queue_.empty()) return false;
+    // Every queued path is also in `pulling_`, so the difference is what we have
+    // already asked for and not yet received.
+    const size_t in_flight = pulling_.size() > pull_queue_.size()
+                                 ? pulling_.size() - pull_queue_.size() : 0;
+    return in_flight < service_.config().max_pending_pulls;
+}
+
+void SyncSession::requester_loop() {
+    for (;;) {
+        std::string path;
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            pull_cv_.wait(lk, [this] { return !running_.load() || may_request_locked(); });
+            if (!running_.load()) return;
+            path = std::move(pull_queue_.front());
+            pull_queue_.pop_front();
+        }
+        send_request(path);  // reads our copy of the file — never on the reactor
+    }
+}
+
+void SyncSession::send_request(const std::string& rel_path) {
+    const auto& cfg = service_.config();
+    auto w = proto::message(proto::Op::Request);
+    w.str16(rel_path);
+
+    // A signature lets the peer answer with a delta. It is only worth building if
+    // we actually hold a copy — the file size doubles as the existence check.
+    bool sent_sig = false;
+    if (cfg.use_delta) {
+        std::string abs = service_.abs_path(rel_path);
+        int64_t have = librats::get_file_size(abs.c_str());
+        if (have >= 0 && static_cast<uint64_t>(have) <= cfg.delta_max_bytes) {
             if (auto sig = signature_of_file(abs, cfg.block_size)) {
                 w.u8(1);
                 sig->encode(w);
                 sent_sig = true;
             }
         }
-        if (!sent_sig) w.u8(0);
-        send_msg(w);
     }
+    if (!sent_sig) w.u8(0);
+    send_msg(w);
+}
 
-    if (mutated) send_manifest_if_changed();  // tell the peer our tree shrank
-    maybe_synced();
+void SyncSession::release_pull(const std::string& rel_path) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        pulling_.erase(rel_path);
+    }
+    pull_cv_.notify_one();  // a window slot just freed up
 }
 
 void SyncSession::maybe_synced() {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (!pulling_.empty() || !incoming_.empty()) return;
-    }
-    if (outstanding_serves_.load() != 0) return;
-
-    Manifest local = service_.local_manifest();
-    Manifest base  = service_.base_manifest();
     Manifest remote;
     {
         std::lock_guard<std::mutex> lk(mtx_);
+        if (!pulling_.empty() || !incoming_.empty() || outstanding_serves_.load() != 0) {
+            // Busy. Whatever we concluded last time is stale by the time the work
+            // lands, so force the next idle moment to look again.
+            last_eval_valid_ = false;
+            return;
+        }
+        // Inbound work has drained: this is the moment to tell the peer what we
+        // picked up, in one update rather than one per file.
+        if (advertise_pending_) advertise_locked();
         if (!have_remote_) return;
+
+        const uint64_t local_ver = service_.manifest_version();
+        if (last_eval_valid_ && last_eval_local_ver_ == local_ver &&
+            last_eval_remote_ver_ == remote_version_)
+            return;  // same inputs as last time — the answer cannot have changed
+        last_eval_valid_ = true;
+        last_eval_local_ver_ = local_ver;
+        last_eval_remote_ver_ = remote_version_;
         remote = remote_;
     }
+
+    Manifest local = service_.local_manifest();
+    Manifest base  = service_.base_manifest();
     const auto& cfg = service_.config();
     ReconcileOptions o;
     o.mode = cfg.mode; o.conflict = cfg.conflict;
@@ -388,18 +532,23 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
 void SyncSession::serve_delta(const Serve& job, const std::string& abs,
                               uint64_t size, int64_t mtime, uint32_t mode) {
     // Read the source into memory (bounded by delta_max_bytes) to run the scan.
+    // Scan it in place: copying it into a vector first would double the peak —
+    // 512 MiB for a file at the delta ceiling, for no gain.
     size_t sz = 0;
     void* raw = librats::read_file_binary(abs.c_str(), &sz);
     if (!raw) { serve_whole(job, abs, size, mtime, mode); return; }
-    std::vector<uint8_t> data(static_cast<uint8_t*>(raw), static_cast<uint8_t*>(raw) + sz);
-    librats::free_file_buffer(raw);
+    struct BufferGuard {
+        void* p;
+        ~BufferGuard() { if (p) librats::free_file_buffer(p); }
+    } guard{raw};
+    const auto* data = static_cast<const uint8_t*>(raw);
 
-    Delta delta = compute_delta(job.sig, data.data(), data.size());
-    Hash digest = sha256(data.data(), data.size());
+    Delta delta = compute_delta(job.sig, data, sz);
+    Hash digest = sha256(data, sz);
 
     auto start = proto::message(proto::Op::FileStart);
     start.u64(job.xid); start.str16(job.rel_path);
-    start.u64(data.size()); start.i64(mtime); start.u32(mode); start.u8(1);
+    start.u64(sz); start.i64(mtime); start.u32(mode); start.u8(1);
     send_msg(start);
 
     const uint32_t chunk = service_.config().chunk_size;
@@ -428,9 +577,9 @@ void SyncSession::serve_delta(const Serve& job, const std::string& abs,
     send_msg(end);
 
     service_.log(0, "sent " + job.rel_path + " as delta (" + std::to_string(on_wire) +
-                    " of " + std::to_string(data.size()) + " bytes on wire)");
+                    " of " + std::to_string(sz) + " bytes on wire)");
     if (service_.events().file_done)
-        service_.events().file_done({TransferInfo::Send, job.rel_path, data.size(), data.size(), true, on_wire});
+        service_.events().file_done({TransferInfo::Send, job.rel_path, sz, sz, true, on_wire});
 }
 
 void SyncSession::note_sent(uint64_t xid, uint64_t bytes) {
@@ -486,12 +635,12 @@ void SyncSession::handle_file_start(BinaryReader& r) {
     fs::remove(in->temp_path, ec);
     if (ec) {
         service_.log(2, "cannot clear stale temp file for " + in->rel_path);
-        abandon_pull(in->rel_path);
+        release_pull(in->rel_path);
         return;
     }
     if (!in->out.open_write(in->temp_path.c_str())) {
         service_.log(2, "cannot open temp file for " + in->rel_path);
-        abandon_pull(in->rel_path);
+        release_pull(in->rel_path);
         return;
     }
     if (in->is_delta) {
@@ -588,8 +737,7 @@ void SyncSession::handle_file_end(BinaryReader& r) {
             w.str16(path); w.u8(0);
             send_msg(w);  // path stays in pulling_, so the round still waits for it
         } else {
-            std::lock_guard<std::mutex> lk(mtx_);
-            pulling_.erase(path);
+            release_pull(path);
         }
         return;
     }
@@ -610,9 +758,11 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
 
     if (!move_replace(in->temp_path, in->final_path)) {
         service_.log(2, "cannot move into place: " + in->rel_path);
-        std::lock_guard<std::mutex> lk(mtx_);
-        pulling_.erase(in->rel_path);
-        incoming_.erase(in->xid);
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            incoming_.erase(in->xid);
+        }
+        release_pull(in->rel_path);
         return;
     }
     in->temp_path.clear();  // moved — nothing for the dtor to clean
@@ -630,23 +780,20 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
 
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        pulling_.erase(in->rel_path);
         incoming_.erase(in->xid);
+        // Our tree grew. Don't describe it to the peer yet: during a bulk pull
+        // that would re-describe the tree once per file, which is the quadratic
+        // cost incremental updates exist to remove. maybe_synced() ships one
+        // update as soon as the inbound queue drains.
+        advertise_pending_ = true;
     }
+    release_pull(in->rel_path);
+
     service_.log(0, "received " + in->rel_path);
     if (service_.events().file_done)
         service_.events().file_done({TransferInfo::Recv, in->rel_path, in->written, in->size, in->is_delta, in->on_wire});
 
-    // Our tree grew: advertise it so the peer sees convergence, then check quiescence.
-    send_manifest_if_changed();
     maybe_synced();
-}
-
-void SyncSession::abandon_pull(const std::string& rel_path) {
-    // We can't take this file right now. Drop the reservation so the path is
-    // re-requested on the next round instead of blocking quiescence forever.
-    std::lock_guard<std::mutex> lk(mtx_);
-    pulling_.erase(rel_path);
 }
 
 void SyncSession::fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why) {
@@ -662,10 +809,7 @@ void SyncSession::handle_not_found(BinaryReader& r) {
     std::string path = r.str16();
     if (!r.ok()) return;
     service_.log(2, "peer no longer has " + path);
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        pulling_.erase(path);
-    }
+    release_pull(path);
     maybe_synced();
 }
 
