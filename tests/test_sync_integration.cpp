@@ -8,6 +8,7 @@
 
 #include "node/node.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -47,6 +48,7 @@ bool wait_until(Pred pred, milliseconds timeout = milliseconds(25000)) {
 // One node+service+scanner rooted at a fresh temp dir, driven directly (no daemon).
 struct Endpoint {
     test::TempDir dir;
+    test::TempDir state;   ///< out of the synced tree, as in a real run
     std::string   root;
     SyncConfig    cfg;
     std::atomic<int>               synced_events{0};
@@ -67,7 +69,7 @@ struct Endpoint {
         : scanner(make_ignore()) {
         root = dir.str();
         cfg.root = root;
-        cfg.data_dir = dir.sub(".rasync");
+        cfg.data_dir = state.str();
         cfg.mode = mode;
         cfg.source = source;
         cfg.conflict = conflict;
@@ -423,13 +425,41 @@ TEST(SyncIntegration, ConvergenceIsAnnouncedAndBaselinePersisted) {
         return a.synced_events.load() > 0 && b.synced_events.load() > 0;
     })) << "neither side ever announced convergence";
 
-    EXPECT_TRUE(std::filesystem::exists(b.dir.sub(".rasync/baseline.man")))
+    EXPECT_TRUE(std::filesystem::exists(b.state.sub("baseline.man")))
         << "no baseline persisted — deletes could not propagate on the next run";
 
     // Nothing changed afterwards, so nothing re-announces it.
     const int seen = b.synced_events.load();
     std::this_thread::sleep_for(milliseconds(400));
     EXPECT_EQ(b.synced_events.load(), seen) << "convergence announced repeatedly";
+}
+
+TEST(SyncIntegration, SyncedDirectoryHoldsNothingButTheSyncedFiles) {
+    // rasync's own state lives outside the tree; the scratch directory is the one
+    // thing it may create inside it, and it must not survive the transfer that
+    // needed it — let alone the process.
+    Endpoint a, b;
+    for (int i = 0; i < 4; ++i)
+        test::write_file(a.dir.sub("f" + std::to_string(i) + ".bin"),
+                         test::random_bytes(64 * 1024, static_cast<uint32_t>(i + 1)));
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] { return disk_state(b.root).size() == 4; })) << "files did not sync";
+
+    const std::filesystem::path scratch = std::filesystem::path(b.root) / kTempDirName;
+    EXPECT_TRUE(wait_until([&] { return !std::filesystem::exists(scratch); }, milliseconds(5000)))
+        << "scratch directory outlived the transfers that needed it";
+
+    b.svc->shutdown();
+    std::vector<std::string> left;
+    for (const auto& e : std::filesystem::directory_iterator(b.root))
+        left.push_back(e.path().filename().string());
+    std::sort(left.begin(), left.end());
+    EXPECT_EQ(left, (std::vector<std::string>{"f0.bin", "f1.bin", "f2.bin", "f3.bin"}))
+        << "rasync left something of its own in the synced directory";
 }
 
 TEST(SyncIntegration, LargeManifestUpdatesAreChunkedAndReassembled) {

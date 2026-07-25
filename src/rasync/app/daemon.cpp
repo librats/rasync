@@ -2,6 +2,7 @@
 
 #include "app/terminal.h"
 #include "core/scanner.h"
+#include "core/state_dir.h"
 #include "net/auth.h"
 #include "net/sync_service.h"
 #include "version.h"
@@ -85,12 +86,26 @@ int run_daemon(const Options& opt) {
         return 2;
     }
     std::string root_str = root.string();
-    std::string data_dir = opt.data_dir.empty() ? (root / ".rasync").string() : opt.data_dir;
+    // State lives with the user, not in the tree: a synced directory should hold
+    // the user's files and nothing else. --data-dir overrides it (a portable
+    // drive, say, where the state should travel with the data).
+    std::string data_dir = opt.data_dir.empty() ? state_dir_for(root_str) : opt.data_dir;
     fs::create_directories(data_dir, ec);
+    record_state_owner(data_dir, root_str);
+
+    // Older versions kept state in <dir>/.rasync. Move it rather than start from
+    // an empty baseline — that would read as "nothing was ever synced" and stop
+    // deletes propagating — and leave the tree clean afterwards.
+    const std::string legacy_dir = (root / ".rasync").string();
+    if (size_t moved = migrate_state_dir(legacy_dir, data_dir))
+        line(term::dim("moved ") + std::to_string(moved) + term::dim(" state file(s) out of ") +
+             root_str + term::dim(" into ") + data_dir);
 
     // ── ignore rules ─────────────────────────────────────────────────────────
     IgnoreList ignore;
-    ignore.add(".rasync");       // our own state + temp dirs never sync
+    // Still excluded by name: a peer on an older version, or a --data-dir
+    // pointed back inside the tree, can put one of these there.
+    ignore.add(".rasync");
     ignore.add(kTempDirName);
     std::string ignore_file = opt.ignore_file.empty() ? (root / ".rasyncignore").string()
                                                       : opt.ignore_file;
@@ -211,6 +226,9 @@ int run_daemon(const Options& opt) {
         // pastes into its --allow, so it has to be copyable from here.
         std::cout << term::gray("  id       ") << node.local_id().to_hex() << "\n";
         std::cout << term::gray("  dir      ") << root_str << "\n";
+        // Worth printing: it is deliberately not next to the data any more, and
+        // it is what a user has to delete to reset a directory's sync history.
+        std::cout << term::gray("  state    ") << data_dir << "\n";
         std::cout << term::gray("  mode     ")
                   << (opt.mode == SyncMode::Mirror
                           ? std::string("mirror (") + (opt.source ? "source" : "replica") + ")"

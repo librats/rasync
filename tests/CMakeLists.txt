@@ -27,6 +27,7 @@ add_executable(rasync_core_tests
     test_delta.cpp
     test_diff.cpp
     test_scanner.cpp
+    test_state_dir.cpp
 )
 target_include_directories(rasync_core_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rasync_core_tests PRIVATE rasync_core GTest::gtest_main)

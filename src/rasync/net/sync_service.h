@@ -35,8 +35,12 @@
 namespace rasync {
 
 /// Scratch directory for in-flight downloads, a sibling of the synced files so a
-/// finished transfer can be renamed into place without crossing a filesystem.
-/// Never synced (the scanner's ignore list excludes it by this exact name).
+/// finished transfer can be renamed into place without crossing a filesystem —
+/// the one thing rasync writes into the tree, and only while a transfer is
+/// running. It is created on demand, removed as soon as the last transfer of a
+/// round lands, and wiped at both startup and shutdown, so an idle rasync leaves
+/// the synced directory holding nothing but the user's own files. Never synced
+/// (the scanner's ignore list excludes it by this exact name).
 constexpr const char* kTempDirName = ".rasync-tmp";
 
 /// Everything that shapes how one directory is synced.
@@ -112,6 +116,7 @@ public:
     void attach();
 
     /// Load the persisted baseline (if any) from data_dir. Call once at startup.
+    /// data_dir lives outside the synced tree by default (see core/state_dir.h).
     void load_baseline();
 
     /// Drop any `.rasync-tmp` leftovers from a previous run (a crash or a kill
@@ -131,7 +136,9 @@ public:
     /// pulled a second time.
     void apply_local_patch(const ManifestPatch& patch);
 
-    /// Stop and drop all sessions (called before node.stop()).
+    /// Stop and drop all sessions, then clear the temp directory out of the
+    /// synced tree (called before node.stop()). Idempotent; after it, a late
+    /// message from the reactor no longer creates a session.
     void shutdown();
 
     // — accessors used by sessions (all thread-safe) —
@@ -161,6 +168,8 @@ public:
 
     std::string abs_path(const std::string& rel) const;
     std::string temp_dir() const;                    ///< <root>/.rasync-tmp
+    std::string ensure_temp_dir() const;             ///< create it (hidden on Windows) and return it
+    void        prune_temp_dir() const;              ///< remove it again once nothing is in flight
     void        send(const librats::PeerId& to, const Bytes& msg);
     void        log(int level, const std::string& msg) const;
 
@@ -188,6 +197,7 @@ private:
 
     std::mutex sessions_mutex_;
     std::unordered_map<librats::PeerId, std::shared_ptr<SyncSession>, librats::PeerId::Hash> sessions_;
+    std::atomic<bool> stopped_{false};   ///< set by shutdown(); no session is created after it
 };
 
 } // namespace rasync

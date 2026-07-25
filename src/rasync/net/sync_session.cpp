@@ -163,9 +163,13 @@ void SyncSession::stop() {
     { std::lock_guard<std::mutex> lk(send_mtx_); send_cv_.notify_all(); }
     if (sender_.joinable()) sender_.join();
     if (requester_.joinable()) requester_.join();
-    std::lock_guard<std::mutex> lk(mtx_);
-    incoming_.clear();  // Incoming dtor drops temp files
-    pull_queue_.clear();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        incoming_.clear();  // Incoming dtor drops temp files
+        pull_queue_.clear();
+    }
+    // Those temp files are gone now, so the directory that held them may be too.
+    service_.prune_temp_dir();
 }
 
 // ── inbound dispatch (reactor thread) ────────────────────────────────────────
@@ -755,8 +759,7 @@ void SyncSession::handle_file_start(BinaryReader& r) {
     }
 
     in->final_path = service_.abs_path(in->rel_path);
-    std::string tmpdir = service_.temp_dir();
-    librats::create_directories(tmpdir.c_str());
+    std::string tmpdir = service_.ensure_temp_dir();
     in->temp_path = librats::combine_paths(tmpdir, temp_tag_ + "-" + std::to_string(in->xid) + ".part");
 
     // The temp file must start empty. FileStream::open_write keeps existing
@@ -910,9 +913,11 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
     meta.hash = in->result_hash;
     service_.note_local_set(in->rel_path, meta);
 
+    bool idle = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         incoming_.erase(in->xid);
+        idle = incoming_.empty();
         // Our tree grew. Don't describe it to the peer yet: during a bulk pull
         // that would re-describe the tree once per file, which is the quadratic
         // cost incremental updates exist to remove. maybe_synced() ships one
@@ -920,6 +925,10 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
         advertise_pending_ = true;
     }
     release_pull(in->rel_path);
+    // Nothing of ours is left in the tree between transfers: the scratch
+    // directory goes away with the last file of the batch (and stays if another
+    // session is still writing into it).
+    if (idle) service_.prune_temp_dir();
 
     service_.log(0, "received " + in->rel_path);
     if (service_.events().file_done)

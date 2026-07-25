@@ -267,18 +267,48 @@ rasync --mirror --replica --peer web.example.com:9000 ./website-backup
 | `--ignore-file <path>` | Load ignore patterns from a file. |
 | `--interval <secs>` | Rescan cadence for change detection (default: 3). |
 | `--once` | Reconcile once with connected peers, then exit. |
-| `--data-dir <path>` | State directory (default: `<directory>/.rasync`). |
+| `--data-dir <path>` | Keep the sync state here instead of in the per-user state directory (see [State](#state-where-rasync-keeps-its-own-files)). |
 | `-v, --verbose` | Show every file operation (and librats internals). |
 | `-q, --quiet` | Only warnings and errors. |
 | `--no-color` | Disable coloured output. |
 | `-h, --help` / `--version` | Help / version. |
 
+### State: where rasync keeps its own files
+
+**The synced directory holds your files and nothing else.** Everything rasync
+remembers between runs — the baseline manifest, the node identity, the DHT
+routing table — lives in the per-user state directory:
+
+| Platform | Location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\rasync\dirs\<name>-<hash>\` |
+| macOS | `~/Library/Application Support/rasync/dirs/<name>-<hash>/` |
+| Linux / BSD | `$XDG_DATA_HOME/rasync/dirs/<name>-<hash>/` (default `~/.local/share/rasync/...`) |
+
+`<name>` is the synced folder's own name and `<hash>` a prefix of the SHA-256 of
+its absolute path, so two directories that happen to share a name never share
+state. Each one contains a `directory.txt` naming the tree it belongs to. The
+exact path is printed as `state` in the startup banner. Set `RASYNC_HOME` to move
+the whole root elsewhere, or `--data-dir <path>` to place one directory's state
+by hand (e.g. on a portable drive, so the state travels with the data).
+
+Upgrading from a version that stored state in `<directory>/.rasync` moves it out
+on the next run — the baseline is preserved (so deletes keep propagating) and the
+directory is left clean.
+
+The one thing rasync writes into the synced tree is `.rasync-tmp/`, the scratch
+directory for in-flight downloads. It has to be there: a finished transfer is
+verified and then *renamed* into place, which must not cross a filesystem. It is
+created on demand, hidden on Windows, never synced, removed as soon as the last
+transfer of a round lands, and wiped at startup and shutdown — so an idle rasync
+leaves nothing behind.
+
 ### Ignoring files
 
 Patterns follow gitignore conventions. Put them in a `.rasyncignore` file at the
 root of the synced directory (auto-loaded), pass `--ignore-file <path>`, or add
-individual `--ignore <pattern>` flags. rasync's own `.rasync/` state directory is
-always excluded.
+individual `--ignore <pattern>` flags. rasync's own `.rasync-tmp/` scratch
+directory (and any `.rasync/` left by an older version) is always excluded.
 
 ```gitignore
 # .rasyncignore
@@ -299,9 +329,11 @@ node_modules/
   until the next real change. (A full-checksum scan mode is a natural future
   addition.)
 - **Baseline & delete propagation.** Two-way delete detection relies on the
-  persisted baseline in `<dir>/.rasync/`. Deleting that state makes rasync treat the
-  next sync as a first-time union (nothing is deleted). Use `--no-delete` for purely
-  additive syncing.
+  persisted baseline in the [state directory](#state-where-rasync-keeps-its-own-files).
+  Deleting that state makes rasync treat the next sync as a first-time union (nothing
+  is deleted). Use `--no-delete` for purely additive syncing. Note that the state is
+  per user and per machine: moving a synced directory to a new path gives it a fresh
+  state directory, and therefore a first-time sync.
 - **Two peers per session.** The design converges any number of peers pairwise, but
   it is built and tested for the two-directory case.
 - **The shared key is symmetric.** There is one secret and it grants full read and

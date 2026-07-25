@@ -2,18 +2,41 @@
 
 #include "net/sync_session.h"
 
+#include "core/state_dir.h"
 #include "util/fs.h"
 
 #include <filesystem>
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
+
 namespace rasync {
+namespace {
+
+/// A dot-prefixed name is already hidden on Unix; Windows needs to be told.
+/// Best-effort — the temp directory works either way.
+void hide_from_listings(const std::string& path) {
+#ifdef _WIN32
+    SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_HIDDEN);
+#else
+    (void)path;
+#endif
+}
+
+} // namespace
 
 SyncService::SyncService(librats::Node& node, SyncConfig config, SyncEvents events)
     : node_(node), config_(std::move(config)), events_(std::move(events)) {
+    // Default the state out of the synced tree: the tree is the user's, and
+    // anything rasync leaves there is clutter it has to clean up later.
     if (config_.data_dir.empty())
-        config_.data_dir = librats::combine_paths(config_.root, ".rasync");
+        config_.data_dir = state_dir_for(config_.root);
 }
 
 SyncService::~SyncService() { shutdown(); }
@@ -41,6 +64,23 @@ void SyncService::clean_temp_dir() {
     auto removed = std::filesystem::remove_all(temp_dir(), ec);
     if (!ec && removed > 1)  // >1 = the directory itself plus at least one leftover
         log(0, "cleared " + std::to_string(removed - 1) + " stale temp file(s)");
+}
+
+std::string SyncService::ensure_temp_dir() const {
+    std::string dir = temp_dir();
+    if (!librats::directory_exists(dir.c_str())) {
+        librats::create_directories(dir.c_str());
+        hide_from_listings(dir);
+    }
+    return dir;
+}
+
+void SyncService::prune_temp_dir() const {
+    // Non-recursive on purpose: this runs whenever *a* session goes idle, while
+    // another may still have a transfer in flight. The remove then simply fails
+    // (directory not empty) and the tree is cleaned by whoever finishes last.
+    std::error_code ec;
+    std::filesystem::remove(temp_dir(), ec);
 }
 
 Manifest SyncService::local_manifest() const {
@@ -131,6 +171,10 @@ std::shared_ptr<SyncSession> SyncService::session_for(const librats::PeerId& id)
     bool created = false;
     {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
+        // After shutdown, a message still in flight on the reactor must not
+        // resurrect a session: it would re-create the temp directory we just
+        // removed, and write into a tree the caller believes we have let go of.
+        if (stopped_) return nullptr;
         auto it = sessions_.find(id);
         if (it != sessions_.end()) return it->second;
         session = std::make_shared<SyncSession>(*this, id);
@@ -146,6 +190,7 @@ bool SyncService::peer_allowed(const librats::PeerId& id) const {
 }
 
 void SyncService::on_peer_up(const librats::PeerId& id) {
+    if (stopped_) return;
     if (!peer_allowed(id)) {
         // Reported once, here, rather than per dropped message: the connection
         // itself is librats' to keep or close, and it will sit there idle. What
@@ -176,17 +221,23 @@ void SyncService::on_message(const librats::PeerId& from, librats::ByteView payl
     // Dropped silently: a disallowed peer is free to keep talking, and one log
     // line per message it sends would be its own denial of service.
     if (!peer_allowed(from)) return;
-    session_for(from)->handle(payload);
+    if (auto session = session_for(from)) session->handle(payload);
 }
 
 void SyncService::shutdown() {
     std::vector<std::shared_ptr<SyncSession>> sessions;
     {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
+        if (stopped_) return;
+        stopped_ = true;
         for (auto& [_, s] : sessions_) sessions.push_back(s);
         sessions_.clear();
     }
     for (auto& s : sessions) s->stop();
+    // Every session has joined its threads, so nothing can be mid-transfer:
+    // whatever is left in the temp directory is scrap. Leave the synced tree
+    // exactly as the user's own files found it.
+    clean_temp_dir();
 }
 
 } // namespace rasync

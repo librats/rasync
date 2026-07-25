@@ -36,7 +36,7 @@ struct Options {
 
     int                      interval = 3;           ///< rescan cadence, seconds
     bool                     once = false;           ///< sync once, then exit
-    std::string              data_dir;               ///< state dir (default <dir>/.rasync)
+    std::string              data_dir;               ///< state dir (default: per-user, see core/state_dir.h)
 
     bool                     no_color = false;
     int                      verbosity = 1;          ///< 0 quiet · 1 normal · 2 verbose

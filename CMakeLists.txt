@@ -34,6 +34,7 @@ add_library(rasync_core STATIC
     src/rasync/core/scanner.cpp
     src/rasync/core/delta.cpp
     src/rasync/core/diff.cpp
+    src/rasync/core/state_dir.cpp
 )
 target_include_directories(rasync_core PUBLIC src/rasync)
 # librats gives us SHA-256 + portable filesystem helpers; nothing more.

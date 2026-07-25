@@ -57,7 +57,9 @@ std::string help_text(const std::string& prog) {
     o << bold("RUN MODE\n");
     o << "  " << green("    --interval") << " <secs>    rescan cadence for change detection (default: 3)\n";
     o << "  " << green("    --once") << "               reconcile once with connected peers, then exit\n";
-    o << "  " << green("    --data-dir") << " <path>    state directory (default: <directory>/.rasync)\n\n";
+    o << "  " << green("    --data-dir") << " <path>    keep sync state here instead of in the\n";
+    o << "                            per-user state directory (nothing of rasync's\n";
+    o << "                            is stored in the synced folder by default)\n\n";
     o << bold("OUTPUT\n");
     o << "  " << green("-v, --verbose") << "            show every file operation\n";
     o << "  " << green("-q, --quiet") << "              only warnings and errors\n";
