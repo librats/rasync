@@ -10,6 +10,11 @@
  * *previous* manifest as a cache: a file whose size and mtime are unchanged
  * reuses its prior hash instead of being re-read. A steady-state rescan of a big
  * tree therefore touches metadata only and hashes nothing — cheap enough to poll.
+ *
+ * Regular files only: a symlink is skipped, never followed. rasync has no way to
+ * represent a link in a manifest, and following one would either copy data from
+ * outside the synced tree to the peer or — for a link that points back into the
+ * tree — walk in circles forever.
  */
 
 #include <cstdint>
@@ -21,10 +26,11 @@
 namespace rasync {
 
 struct ScanStats {
-    uint64_t files_seen   = 0;  ///< regular files considered (post-ignore)
-    uint64_t files_hashed = 0;  ///< files actually read + hashed this scan
-    uint64_t bytes_hashed = 0;  ///< bytes read for hashing this scan
-    uint64_t dirs_seen    = 0;
+    uint64_t files_seen       = 0;  ///< regular files considered (post-ignore)
+    uint64_t files_hashed     = 0;  ///< files actually read + hashed this scan
+    uint64_t bytes_hashed     = 0;  ///< bytes read for hashing this scan
+    uint64_t dirs_seen        = 0;
+    uint64_t symlinks_skipped = 0;  ///< links passed over (never followed, never synced)
 };
 
 class Scanner {

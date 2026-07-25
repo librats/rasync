@@ -305,6 +305,37 @@ TEST(SyncIntegration, DeletionPropagates) {
     })) << "deletion did not propagate";
 }
 
+TEST(SyncIntegration, PropagatedDeletionPrunesEmptyDirectories) {
+    Endpoint a, b;
+    // A transfer creates parent directories on the way in, so B ends up holding
+    // nested/deep/ purely because gone.txt arrived through it.
+    test::write_file(a.dir.sub("nested/deep/gone.txt"), "x");
+    test::write_file(a.dir.sub("nested/keep.txt"), "y");
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] { return disk_state(b.root).size() == 2; }))
+        << "initial files did not sync";
+    ASSERT_TRUE(std::filesystem::exists(b.dir.sub("nested/deep")));
+
+    std::filesystem::remove(a.dir.sub("nested/deep/gone.txt"));
+    a.publish();
+
+    ASSERT_TRUE(wait_until([&] { return !disk_state(b.root).contains("nested/deep/gone.txt"); }))
+        << "deletion did not propagate";
+
+    // Poll for the pruning rather than asserting straight away: it happens just
+    // after the unlink, so the file being gone does not yet prove it has run.
+    ASSERT_TRUE(wait_until([&] { return !std::filesystem::exists(b.dir.sub("nested/deep")); }))
+        << "the directory the deletion emptied was not pruned";
+
+    // Pruning stops at the first ancestor that still holds something.
+    EXPECT_TRUE(std::filesystem::exists(b.dir.sub("nested/keep.txt")));
+    EXPECT_TRUE(std::filesystem::exists(b.root));
+}
+
 TEST(SyncIntegration, StaleTempFilesAreClearedAtStartup) {
     Endpoint a;
     // A leftover from a killed run: the name a session would pick again, since

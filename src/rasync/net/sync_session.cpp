@@ -83,6 +83,27 @@ bool remove_file(const std::string& path) {
     }
 }
 
+// Drop the directories a removed file left behind, innermost first, stopping at
+// the sync root. Transfers create parent directories on the way in, so without
+// this a deleted subtree survives as a skeleton of empty folders that nothing
+// will ever clean up — and the two trees stop looking alike to their owners even
+// though every tracked file agrees.
+//
+// `fs::remove` refuses a non-empty directory, so a parent that still holds
+// anything — an ignored file, a sibling, a file that landed a moment ago — is
+// left alone by construction: there is no emptiness check here to race against.
+// Only directories rasync itself emptied are considered; one the user emptied by
+// hand is not rasync's to remove. `rel_path` comes from our own scanner (nothing
+// else can reach `delete_local`), so joining it onto the root stays inside it.
+void prune_empty_dirs(const std::string& root, const std::string& rel_path) {
+    const fs::path root_path(root);
+    for (fs::path dir = fs::path(rel_path).parent_path(); !dir.empty();
+         dir = dir.parent_path()) {
+        std::error_code ec;
+        if (!fs::remove(root_path / dir, ec) || ec) return;  // not empty, or gone
+    }
+}
+
 // Move `from` onto `to`, replacing an existing `to`, creating parent dirs.
 bool move_replace(const std::string& from, const std::string& to) {
     std::error_code ec;
@@ -385,6 +406,7 @@ void SyncSession::reconcile_and_act() {
             service_.log(2, "cannot delete " + path + " (in use) — will retry");
             continue;
         }
+        prune_empty_dirs(service_.config().root, path);
         service_.note_local_removed(path);
         mutated = true;
         service_.log(0, "deleted " + path);
