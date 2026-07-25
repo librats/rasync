@@ -35,6 +35,7 @@ gtest_discover_tests(rasync_core_tests DISCOVERY_TIMEOUT 60)
 # ── protocol + end-to-end networking tests (need the net layer) ──────────────
 if(TARGET rasync_net AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_sync_integration.cpp)
     add_executable(rasync_net_tests
+        test_auth.cpp
         test_protocol.cpp
         test_sync_integration.cpp
     )

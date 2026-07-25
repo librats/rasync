@@ -42,6 +42,7 @@ target_link_libraries(rasync_core PUBLIC rats)
 # ── rasync_net: the sync protocol + session, built on librats' Node ──────────
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/rasync/net/sync_session.cpp)
 add_library(rasync_net STATIC
+    src/rasync/net/auth.cpp
     src/rasync/net/protocol.cpp
     src/rasync/net/sync_session.cpp
     src/rasync/net/sync_service.cpp

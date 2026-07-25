@@ -19,7 +19,8 @@ struct Options {
     std::string              directory;              ///< the tree to keep in sync (required)
     uint16_t                 port = 0;               ///< listen port (0 = ephemeral)
     std::vector<std::string> peers;                  ///< explicit "host:port" peers to dial
-    std::string              key;                    ///< shared discovery key (enables DHT+mDNS)
+    std::string              key;                    ///< shared secret: gates the handshake, keys discovery
+    std::vector<std::string> allow;                  ///< peer ids (64 hex) allowed to sync; empty = any
     bool                     discover = false;       ///< enable DHT + mDNS discovery
     bool                     lan_only = false;       ///< restrict discovery to mDNS (LAN)
 

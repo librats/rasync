@@ -37,8 +37,11 @@ $ rasync --peer a.example.com:9000 ./photos    # host B: keep ./photos identical
   an **rsync-style delta** — only changed blocks travel; unchanged blocks are
   reconstructed from the receiver's own copy. Renames/duplicates are free (matched
   by content hash).
-- **Encrypted & authenticated.** All traffic rides librats' Noise_XX transport;
-  peers are self-certifying (a peer's identity *is* its public key).
+- **Encrypted & access-controlled.** All traffic rides librats' Noise_XX transport;
+  peers are self-certifying (a peer's identity *is* its public key). `--key` makes
+  that key a shared secret bound into the handshake, so a peer without it cannot
+  connect at all; `--allow` pins the exact peer ids you sync with. See
+  [Access control](#access-control).
 - **Automatic peer discovery.** Optionally find the other side over the DHT and/or
   mDNS by a shared key — no fixed IPs required.
 - **Integrity end-to-end.** Every transferred file is verified against a whole-file

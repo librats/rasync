@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "core/scanner.h"
+#include "net/auth.h"
 #include "net/sync_service.h"
 #include "version.h"
 #include "test_util.h"
@@ -54,9 +55,15 @@ struct Endpoint {
     Scanner       scanner;
     Manifest      current;
 
+    /// `key` and `allow` are the two access controls: the first gates the librats
+    /// handshake (via the derived protocol id), the second gates syncing once the
+    /// handshake is through. An allow-list entry has to be a peer id we already
+    /// hold, which is why the endpoint whose id is listed must be built first.
     explicit Endpoint(SyncMode mode = SyncMode::TwoWay, bool source = false,
                       size_t max_update_bytes = 0,
-                      ConflictPolicy conflict = ConflictPolicy::Newer)
+                      ConflictPolicy conflict = ConflictPolicy::Newer,
+                      const std::string& key = {},
+                      const std::vector<librats::PeerId>& allow = {})
         : scanner(make_ignore()) {
         root = dir.str();
         cfg.root = root;
@@ -64,12 +71,13 @@ struct Endpoint {
         cfg.mode = mode;
         cfg.source = source;
         cfg.conflict = conflict;
+        cfg.allowed_peers.insert(allow.begin(), allow.end());
         if (max_update_bytes) cfg.max_update_bytes = max_update_bytes;
 
         librats::NodeConfig ncfg;
         ncfg.listen_port = 0;
         ncfg.bind_address = "127.0.0.1";
-        ncfg.protocol = kProtocolName;
+        ncfg.protocol = protocol_id(key);
         ncfg.data_dir = cfg.data_dir;
         ncfg.enable_network_monitor = false;
         node = std::make_unique<librats::Node>(ncfg);
@@ -622,6 +630,78 @@ TEST(SyncIntegration, UnsafePeerPathsNeverEnterThePullWindow) {
     EXPECT_EQ(requested.front(), "ok.txt");
     EXPECT_FALSE(std::filesystem::exists(a.dir.sub("../rasync-escaped-a.txt")));
     EXPECT_FALSE(std::filesystem::exists(a.dir.sub("../rasync-escaped-b.txt")));
+}
+
+TEST(SyncIntegration, PeersSharingAKeySync) {
+    Endpoint a(SyncMode::TwoWay, false, 0, ConflictPolicy::Newer, "shared-secret");
+    Endpoint b(SyncMode::TwoWay, false, 0, ConflictPolicy::Newer, "shared-secret");
+    test::write_file(a.dir.sub("doc.txt"), "keyed content");
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        return disk_state(b.root).contains("doc.txt");
+    })) << "peers with the same key never synced";
+    EXPECT_EQ(test::read_file(b.dir.sub("doc.txt")), "keyed content");
+}
+
+TEST(SyncIntegration, PeerWithTheWrongKeyGetsNothing) {
+    // The key is folded into the protocol id, which librats binds into the Noise
+    // prologue: the wrong key cannot finish the handshake at all, so this holds
+    // however the peer reached us — dialed by hand, as here, or found over DHT.
+    Endpoint a(SyncMode::TwoWay, false, 0, ConflictPolicy::Newer, "right-key");
+    Endpoint b(SyncMode::TwoWay, false, 0, ConflictPolicy::Newer, "wrong-key");
+    test::write_file(a.dir.sub("private.txt"), "not for you");
+    test::write_file(b.dir.sub("theirs.txt"), "not for them either");
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    EXPECT_FALSE(wait_until([&] {
+        return disk_state(b.root).contains("private.txt") ||
+               disk_state(a.root).contains("theirs.txt");
+    }, milliseconds(3000))) << "the tree crossed a key boundary";
+    EXPECT_EQ(a.synced_events.load(), 0);
+    EXPECT_EQ(b.synced_events.load(), 0);
+}
+
+TEST(SyncIntegration, AllowListIgnoresAnUnlistedPeer) {
+    // Same key (none here), so the handshake succeeds — the allow-list is the
+    // layer that still has to refuse, and it must refuse in both directions.
+    auto stranger = librats::PeerId::from_hex(std::string(64, 'a'));
+    ASSERT_TRUE(stranger.has_value());
+    Endpoint a(SyncMode::TwoWay, false, 0, ConflictPolicy::Newer, {}, {*stranger});
+    Endpoint b;
+    test::write_file(a.dir.sub("private.txt"), "not for you");
+    test::write_file(b.dir.sub("theirs.txt"), "not for them either");
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    EXPECT_FALSE(wait_until([&] {
+        return disk_state(b.root).contains("private.txt") ||
+               disk_state(a.root).contains("theirs.txt");
+    }, milliseconds(3000))) << "an unlisted peer was served";
+    EXPECT_EQ(a.synced_events.load(), 0);
+}
+
+TEST(SyncIntegration, AllowListAdmitsAListedPeer) {
+    Endpoint b;  // built first: A can only list an id that already exists
+    Endpoint a(SyncMode::TwoWay, false, 0, ConflictPolicy::Newer, {}, {b.node->local_id()});
+    test::write_file(a.dir.sub("doc.txt"), "allowed content");
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        return disk_state(b.root).contains("doc.txt");
+    })) << "a listed peer was refused";
+    EXPECT_EQ(test::read_file(b.dir.sub("doc.txt")), "allowed content");
 }
 
 TEST(SyncIntegration, MirrorReplicaFollowsSource) {

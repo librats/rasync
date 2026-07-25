@@ -3,6 +3,7 @@
 #include "app/terminal.h"
 #include "version.h"
 
+#include <cctype>
 #include <sstream>
 
 namespace rasync {
@@ -13,6 +14,16 @@ bool parse_uint(const std::string& s, unsigned long& out) {
     char* end = nullptr;
     out = std::strtoul(s.c_str(), &end, 10);
     return end && *end == '\0';
+}
+
+/// A peer id as printed in the banner: the 64 hex chars of a SHA-256. Checked
+/// here so a typo is a startup error instead of a peer that silently never
+/// matches the allow-list.
+bool is_peer_id(const std::string& s) {
+    if (s.size() != 64) return false;
+    for (char c : s)
+        if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+    return true;
 }
 
 } // namespace
@@ -27,7 +38,9 @@ std::string help_text(const std::string& prog) {
     o << bold("CONNECTION\n");
     o << "  " << green("-p, --port") << " <n>         listen on TCP port <n> (default: ephemeral)\n";
     o << "  " << green("    --peer") << " <host:port>  dial a specific peer (repeatable)\n";
-    o << "  " << green("    --key") << " <secret>      auto-discover peers sharing this key (DHT + mDNS)\n";
+    o << "  " << green("    --key") << " <secret>      shared secret: peers must match it to connect\n";
+    o << "                            (also keys auto-discovery over DHT + mDNS)\n";
+    o << "  " << green("    --allow") << " <peer-id>    only sync with this peer id (64 hex, repeatable)\n";
     o << "  " << green("    --discover") << "           enable DHT + mDNS discovery without a key\n";
     o << "  " << green("    --lan") << "                discover on the local network only (mDNS)\n\n";
     o << bold("SYNC BEHAVIOUR\n");
@@ -56,8 +69,9 @@ std::string help_text(const std::string& prog) {
     o << "  " << prog << " -p 9000 ./data\n";
     o << dim("  # Host B: connect to A and keep ./data identical\n");
     o << "  " << prog << " --peer a.example.com:9000 ./data\n";
-    o << dim("  # Both hosts: find each other automatically by a shared key\n");
-    o << "  " << prog << " --key my-project ./data\n";
+    o << dim("  # Both hosts: find each other automatically, and only each other,\n");
+    o << dim("  # by a shared secret (a peer without it cannot even handshake)\n");
+    o << "  " << prog << " --key s3cr3t-passphrase ./data\n";
     o << dim("  # One-way backup mirror (source pushes, replica follows)\n");
     o << "  " << prog << " --mirror --source -p 9000 ./data      " << dim("(on the source)") << "\n";
     o << "  " << prog << " --mirror --replica --peer host:9000 ./backup\n";
@@ -100,6 +114,12 @@ ParseResult parse_args(int argc, char** argv) {
         }
         else if (arg == "--peer")                  o.peers.push_back(next(arg));
         else if (arg == "--key")                 { o.key = next(arg); o.discover = true; }
+        else if (arg == "--allow") {
+            std::string id = next(arg);
+            if (res.action == ParseResult::Error) return res;
+            if (!is_peer_id(id)) return fail("--allow expects a 64-character hex peer id, got: " + id);
+            o.allow.push_back(id);
+        }
         else if (arg == "--discover")              o.discover = true;
         else if (arg == "--lan")                 { o.lan_only = true; o.discover = true; }
         else if (arg == "--mirror")                o.mode = SyncMode::Mirror;

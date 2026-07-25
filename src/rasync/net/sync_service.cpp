@@ -141,12 +141,27 @@ std::shared_ptr<SyncSession> SyncService::session_for(const librats::PeerId& id)
     return session;
 }
 
+bool SyncService::peer_allowed(const librats::PeerId& id) const {
+    return config_.allowed_peers.empty() || config_.allowed_peers.count(id) != 0;
+}
+
 void SyncService::on_peer_up(const librats::PeerId& id) {
+    if (!peer_allowed(id)) {
+        // Reported once, here, rather than per dropped message: the connection
+        // itself is librats' to keep or close, and it will sit there idle. What
+        // matters is that no session exists, so nothing of the tree is ever
+        // described or served to it.
+        log(2, "peer " + id.to_hex() + " is not in the allow-list — ignoring it");
+        return;
+    }
     session_for(id);
     if (events_.peer_up) events_.peer_up(id);
 }
 
 void SyncService::on_peer_down(const librats::PeerId& id) {
+    // Symmetric with on_peer_up: a peer we never counted as up must not be
+    // reported down, or the UI's peer count drifts negative.
+    if (!peer_allowed(id)) return;
     std::shared_ptr<SyncSession> session;
     {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
@@ -158,6 +173,9 @@ void SyncService::on_peer_down(const librats::PeerId& id) {
 }
 
 void SyncService::on_message(const librats::PeerId& from, librats::ByteView payload) {
+    // Dropped silently: a disallowed peer is free to keep talking, and one log
+    // line per message it sends would be its own denial of service.
+    if (!peer_allowed(from)) return;
     session_for(from)->handle(payload);
 }
 

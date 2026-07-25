@@ -2,6 +2,7 @@
 
 #include "app/terminal.h"
 #include "core/scanner.h"
+#include "net/auth.h"
 #include "net/sync_service.h"
 #include "version.h"
 
@@ -105,6 +106,11 @@ int run_daemon(const Options& opt) {
     cfg.source = opt.source;
     cfg.propagate_deletes = !opt.no_delete;
     cfg.use_delta = !opt.no_delta;
+    for (const auto& hex : opt.allow) {
+        auto id = librats::PeerId::from_hex(hex);
+        if (!id) { line(term::red("error: ") + "bad --allow peer id: " + hex); return 2; }
+        cfg.allowed_peers.insert(*id);
+    }
 
     // ── terminal event handlers ──────────────────────────────────────────────
     // Shared liveness counters, read by the --once exit check. Declared before the
@@ -158,7 +164,10 @@ int run_daemon(const Options& opt) {
     ncfg.listen_port = opt.port;
     ncfg.enable_listen = true;
     ncfg.bind_address = "::";
-    ncfg.protocol = kProtocolName;
+    // The shared key is folded into the protocol id, which librats binds into the
+    // Noise prologue — that, not discovery, is what stops an uninvited peer: it
+    // cannot finish the handshake however it found us.
+    ncfg.protocol = protocol_id(opt.key);
     ncfg.data_dir = data_dir;
 
     librats::Node node(ncfg);
@@ -171,7 +180,7 @@ int run_daemon(const Options& opt) {
     if (opt.discover && !opt.lan_only) {
         librats::DhtDiscovery::Config dcfg;
         dcfg.data_dir = data_dir;
-        dcfg.discovery_key = opt.key.empty() ? std::string(kProtocolName) : ("rasync:" + opt.key);
+        dcfg.discovery_key = discovery_id(opt.key);
         dht = node.add_subsystem(std::make_unique<librats::DhtDiscovery>(dcfg));
     }
     if (opt.discover) {
@@ -197,8 +206,10 @@ int run_daemon(const Options& opt) {
     // ── banner ────────────────────────────────────────────────────────────────
     {
         std::lock_guard<std::mutex> lk(g_print);
-        std::cout << "\n" << term::bold(term::cyan("rasync")) << " " << kVersion << "  "
-                  << term::gray("node " + node.local_id().short_hex()) << "\n";
+        std::cout << "\n" << term::bold(term::cyan("rasync")) << " " << kVersion << "\n";
+        // Full id, not the short form used in logs: this is the string a peer
+        // pastes into its --allow, so it has to be copyable from here.
+        std::cout << term::gray("  id       ") << node.local_id().to_hex() << "\n";
         std::cout << term::gray("  dir      ") << root_str << "\n";
         std::cout << term::gray("  mode     ")
                   << (opt.mode == SyncMode::Mirror
@@ -206,11 +217,18 @@ int run_daemon(const Options& opt) {
                           : "two-way")
                   << (cfg.use_delta ? "" : term::dim("  no-delta"))
                   << (cfg.propagate_deletes ? "" : term::dim("  no-delete")) << "\n";
+        // Never echo the key itself — it is a password, and this line is what ends
+        // up in screenshots and CI logs.
+        std::string access = opt.key.empty()
+                                 ? term::yellow("open — any rasync peer that reaches this port can sync")
+                                 : term::green("shared key");
+        if (!cfg.allowed_peers.empty())
+            access += term::gray(" · " + std::to_string(cfg.allowed_peers.size()) + " allowed peer(s)");
+        std::cout << term::gray("  access   ") << access << "\n";
         std::cout << term::gray("  listen   ") << "port " << node.listen_port() << "\n";
         if (opt.discover)
             std::cout << term::gray("  discover ")
-                      << (opt.lan_only ? "mDNS (LAN)" : "DHT + mDNS")
-                      << (opt.key.empty() ? "" : "  key=" + opt.key) << "\n";
+                      << (opt.lan_only ? "mDNS (LAN)" : "DHT + mDNS") << "\n";
         if (dht)
             std::cout << term::gray("  dht      ") << "port " << dht->dht_port() << "\n";
         std::cout << "\n";

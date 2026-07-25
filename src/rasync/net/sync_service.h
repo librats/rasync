@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "core/diff.h"
 #include "core/manifest.h"
@@ -46,6 +47,14 @@ struct SyncConfig {
     ConflictPolicy conflict          = ConflictPolicy::Newer;
     bool           source            = false;   ///< mirror mode: this side is authoritative
     bool           propagate_deletes = true;
+
+    /// If non-empty, the only peers we will sync with. Anyone else still
+    /// completes the librats handshake (they hold the shared key, or there is no
+    /// key) but is then ignored outright: no session, so we never describe our
+    /// tree and never serve a request. This is the second lever on top of the
+    /// key — it survives a leaked key, and it is the only one available when
+    /// running keyless. Empty = any peer that handshakes may sync.
+    std::unordered_set<librats::PeerId, librats::PeerId::Hash> allowed_peers;
 
     bool     use_delta        = true;                       ///< rsync-style delta for changed files
     uint32_t block_size       = kDefaultBlockSize;
@@ -158,6 +167,7 @@ public:
 private:
     void on_peer_up(const librats::PeerId& id);
     void on_peer_down(const librats::PeerId& id);
+    bool peer_allowed(const librats::PeerId& id) const;  ///< against config_.allowed_peers
     void on_message(const librats::PeerId& from, librats::ByteView payload);
     void notify_sessions();   ///< tell every session the local tree moved
     std::shared_ptr<SyncSession> session_for(const librats::PeerId& id);
