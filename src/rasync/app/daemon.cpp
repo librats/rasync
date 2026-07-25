@@ -90,7 +90,7 @@ int run_daemon(const Options& opt) {
     // ── ignore rules ─────────────────────────────────────────────────────────
     IgnoreList ignore;
     ignore.add(".rasync");       // our own state + temp dirs never sync
-    ignore.add(".rasync-tmp");
+    ignore.add(kTempDirName);
     std::string ignore_file = opt.ignore_file.empty() ? (root / ".rasyncignore").string()
                                                       : opt.ignore_file;
     ignore.add_file(ignore_file);
@@ -165,6 +165,7 @@ int run_daemon(const Options& opt) {
     SyncService service(node, cfg, ev);
     service.attach();
     service.load_baseline();
+    service.clean_temp_dir();  // before the node starts: no transfer can be live yet
 
     librats::DhtDiscovery* dht = nullptr;
     if (opt.discover && !opt.lan_only) {

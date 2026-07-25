@@ -4,6 +4,7 @@
 
 #include "util/fs.h"
 
+#include <filesystem>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,13 @@ void SyncService::load_baseline() {
         base_ = std::move(*m);
         log(0, "loaded baseline with " + std::to_string(base_.size()) + " entries");
     }
+}
+
+void SyncService::clean_temp_dir() {
+    std::error_code ec;
+    auto removed = std::filesystem::remove_all(temp_dir(), ec);
+    if (!ec && removed > 1)  // >1 = the directory itself plus at least one leftover
+        log(0, "cleared " + std::to_string(removed - 1) + " stale temp file(s)");
 }
 
 Manifest SyncService::local_manifest() const {
@@ -79,6 +87,10 @@ void SyncService::set_local_manifest(Manifest m) {
 
 std::string SyncService::abs_path(const std::string& rel) const {
     return librats::combine_paths(config_.root, rel);
+}
+
+std::string SyncService::temp_dir() const {
+    return librats::combine_paths(config_.root, kTempDirName);
 }
 
 void SyncService::send(const librats::PeerId& to, const Bytes& msg) {

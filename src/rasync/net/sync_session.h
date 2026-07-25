@@ -113,6 +113,7 @@ private:
     void note_sent(uint64_t xid, uint64_t bytes);
 
     // helpers
+    void abandon_pull(const std::string& rel_path);  ///< release a path we can't receive
     void finalize_incoming(const std::shared_ptr<Incoming>& in);
     void fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why);
     void send_msg(BinaryWriter& w);
@@ -120,6 +121,7 @@ private:
 
     SyncService&    service_;
     librats::PeerId peer_;
+    std::string     temp_tag_;   ///< peer-derived prefix that scopes our temp files
 
     std::mutex               mtx_;             ///< guards the state below
     Manifest                 remote_;          ///< peer's last-advertised manifest

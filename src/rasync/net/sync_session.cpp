@@ -81,7 +81,13 @@ SyncSession::Incoming::~Incoming() {
 // ── lifecycle ────────────────────────────────────────────────────────────────
 
 SyncSession::SyncSession(SyncService& service, librats::PeerId peer)
-    : service_(service), peer_(std::move(peer)) {}
+    : service_(service), peer_(std::move(peer)) {
+    // Temp files are named per (peer, transfer). xid alone is not unique: it
+    // restarts at 1 in every session, so two peers syncing the same root would
+    // pick the same name and interleave their writes into one file. 16 hex chars
+    // of the peer's public key make that collision infeasible to hit or to forge.
+    temp_tag_ = peer_.to_hex().substr(0, 16);
+}
 
 SyncSession::~SyncSession() { stop(); }
 
@@ -468,12 +474,24 @@ void SyncSession::handle_file_start(BinaryReader& r) {
     if (!r.ok() || !is_safe_rel(in->rel_path)) return;
 
     in->final_path = service_.abs_path(in->rel_path);
-    std::string tmpdir = librats::combine_paths(service_.config().root, ".rasync-tmp");
+    std::string tmpdir = service_.temp_dir();
     librats::create_directories(tmpdir.c_str());
-    in->temp_path = librats::combine_paths(tmpdir, std::to_string(in->xid) + ".part");
+    in->temp_path = librats::combine_paths(tmpdir, temp_tag_ + "-" + std::to_string(in->xid) + ".part");
 
+    // The temp file must start empty. FileStream::open_write keeps existing
+    // content (it writes positioned, never truncates), and our SHA-256 covers the
+    // bytes we write — not the file — so a leftover tail from an earlier, larger
+    // transfer would survive verification and be renamed into place as corruption.
+    std::error_code ec;
+    fs::remove(in->temp_path, ec);
+    if (ec) {
+        service_.log(2, "cannot clear stale temp file for " + in->rel_path);
+        abandon_pull(in->rel_path);
+        return;
+    }
     if (!in->out.open_write(in->temp_path.c_str())) {
         service_.log(2, "cannot open temp file for " + in->rel_path);
+        abandon_pull(in->rel_path);
         return;
     }
     if (in->is_delta) {
@@ -622,6 +640,13 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
     // Our tree grew: advertise it so the peer sees convergence, then check quiescence.
     send_manifest_if_changed();
     maybe_synced();
+}
+
+void SyncSession::abandon_pull(const std::string& rel_path) {
+    // We can't take this file right now. Drop the reservation so the path is
+    // re-requested on the next round instead of blocking quiescence forever.
+    std::lock_guard<std::mutex> lk(mtx_);
+    pulling_.erase(rel_path);
 }
 
 void SyncSession::fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why) {

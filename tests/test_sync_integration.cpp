@@ -21,7 +21,7 @@ namespace {
 IgnoreList make_ignore() {
     IgnoreList ig;
     ig.add(".rasync");
-    ig.add(".rasync-tmp");
+    ig.add(kTempDirName);
     return ig;
 }
 
@@ -232,6 +232,40 @@ TEST(SyncIntegration, DeletionPropagates) {
         Manifest db = disk_state(b.root);
         return !db.contains("remove.txt") && db.contains("keep.txt");
     })) << "deletion did not propagate";
+}
+
+TEST(SyncIntegration, StaleTempFilesAreClearedAtStartup) {
+    Endpoint a;
+    // A leftover from a killed run: the name a session would pick again, since
+    // xids restart at 1. If it survived, open_write would append into it.
+    std::string stale = a.dir.sub(std::string(kTempDirName) + "/dead-1.part");
+    test::write_file(stale, std::string(4096, 'x'));
+    ASSERT_TRUE(std::filesystem::exists(stale));
+
+    a.svc->clean_temp_dir();
+
+    EXPECT_FALSE(std::filesystem::exists(stale));
+    EXPECT_FALSE(std::filesystem::exists(a.dir.sub(kTempDirName)));
+}
+
+TEST(SyncIntegration, TempFilesDoNotOutliveTheTransfer) {
+    Endpoint a, b;
+    test::write_file(a.dir.sub("payload.bin"), test::random_bytes(300 * 1024, 7));
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        return disk_state(a.root).fingerprint() == disk_state(b.root).fingerprint() &&
+               disk_state(b.root).contains("payload.bin");
+    })) << "file did not sync";
+
+    // A converged receiver must leave no .part behind: every temp file is either
+    // renamed into place or dropped by ~Incoming.
+    std::error_code ec;
+    for (auto& e : std::filesystem::directory_iterator(b.dir.sub(kTempDirName), ec))
+        ADD_FAILURE() << "leftover temp file: " << e.path().string();
 }
 
 TEST(SyncIntegration, MirrorReplicaFollowsSource) {

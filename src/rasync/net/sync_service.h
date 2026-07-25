@@ -31,6 +31,11 @@
 
 namespace rasync {
 
+/// Scratch directory for in-flight downloads, a sibling of the synced files so a
+/// finished transfer can be renamed into place without crossing a filesystem.
+/// Never synced (the scanner's ignore list excludes it by this exact name).
+constexpr const char* kTempDirName = ".rasync-tmp";
+
 /// Everything that shapes how one directory is synced.
 struct SyncConfig {
     std::string    root;                 ///< absolute path of the synced directory
@@ -86,6 +91,11 @@ public:
     /// Load the persisted baseline (if any) from data_dir. Call once at startup.
     void load_baseline();
 
+    /// Drop any `.rasync-tmp` leftovers from a previous run (a crash or a kill
+    /// mid-transfer strands `.part` files there). Call once at startup, BEFORE
+    /// node.start() — it is unconditional, so it must not race a live transfer.
+    void clean_temp_dir();
+
     /// Replace the current local manifest (called by the daemon after each scan)
     /// and nudge every session to re-sync if it changed.
     void set_local_manifest(Manifest m);
@@ -106,6 +116,7 @@ public:
     void note_local_removed(const std::string& path);
 
     std::string abs_path(const std::string& rel) const;
+    std::string temp_dir() const;                    ///< <root>/.rasync-tmp
     void        send(const librats::PeerId& to, const Bytes& msg);
     void        log(int level, const std::string& msg) const;
 
