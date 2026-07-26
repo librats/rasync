@@ -602,7 +602,11 @@ void SyncSession::serve_one(const Serve& job) {
     uint64_t size = static_cast<uint64_t>(fsize);
     int64_t mtime = static_cast<int64_t>(librats::get_file_modified_time(abs));
     uint32_t mode = 0;
-    if (const FileMeta* m = service_.local_manifest().find(job.rel_path)) mode = m->mode;
+    // Bind the manifest to a named object: local_manifest() hands back a copy, and
+    // find() points inside it — a pointer into the temporary would dangle before
+    // the body of this statement ever ran.
+    const Manifest local = service_.local_manifest();
+    if (const FileMeta* m = local.find(job.rel_path)) mode = m->mode;
 
     {
         std::lock_guard<std::mutex> lk(send_mtx_);
