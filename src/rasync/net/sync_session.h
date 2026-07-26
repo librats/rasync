@@ -4,7 +4,9 @@
  * @file sync_session.h
  * @brief The per-peer reconciliation + transfer state machine.
  *
- * One SyncSession drives the protocol with exactly one peer. It is symmetric:
+ * One SyncSession drives the protocol with exactly one peer, for exactly one
+ * folder — a peer sharing three folders has three of these, multiplexed over the
+ * one connection by the folder tag every message carries. It is symmetric:
  * both ends run the same logic. On any manifest change (ours or theirs) it
  * reconciles the two trees, applies its own deletions, and requests the files it
  * needs; concurrently it serves the peer's requests from a background sender
@@ -62,9 +64,11 @@ public:
     SyncSession(SyncService& service, librats::PeerId peer);
     ~SyncSession();
 
-    void start();                              ///< say Hello; begin discovery
+    void start();                              ///< spin up the sender/requester threads
     void stop();                               ///< tear down: join sender, drop temp files
-    void handle(librats::ByteView payload);    ///< one inbound protocol message (reactor thread)
+    /// One inbound message for this folder (reactor thread), header already
+    /// peeled by SyncRouter: `op` is the opcode, `r` is positioned at the body.
+    void handle(proto::Op op, BinaryReader& r);
     void local_changed();                      ///< the local tree changed — re-advertise + reconcile
 
     const librats::PeerId& peer() const { return peer_; }
@@ -100,6 +104,10 @@ private:
         uint64_t    xid = 0;
     };
 
+    /// Begin a message for this folder: every one we put on the wire carries the
+    /// service's tag, so no call site can forget it.
+    BinaryWriter msg(proto::Op op) const;
+
     // message handlers
     void handle_hello(BinaryReader& r);
     void handle_manifest_update(BinaryReader& r);
@@ -112,7 +120,6 @@ private:
     void handle_not_found(BinaryReader& r);
 
     // reconciliation
-    void send_hello();
     void advertise();               ///< ship whatever the peer hasn't heard yet
     void advertise_locked();        ///< …with mtx_ already held (keeps updates ordered)
     void send_update_locked(const ManifestPatch& patch, bool reset);

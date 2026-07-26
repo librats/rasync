@@ -44,6 +44,16 @@ std::string state_dir_name(const std::string& sync_root);
 /// all — a state directory that cannot be found again is worse than an in-tree one.
 std::string state_dir_for(const std::string& sync_root);
 
+/// The *node's* own state — its identity key and DHT routing table — at
+/// `<user_state_root>/node`. Empty when there is no user state root; the caller
+/// then has to pick somewhere (the daemon falls back to the first folder's).
+///
+/// This is deliberately not any folder's state directory. One process syncs many
+/// folders over one node, so tying the identity to a folder would make the peer
+/// id — the thing `--allow` lists and peers recognise us by — depend on which
+/// directory happened to be named first on the command line.
+std::string node_state_dir();
+
 /// Drop a `directory.txt` next to the state, naming the tree it belongs to.
 /// The state directory's own name is hashed and therefore unreadable; this is
 /// what makes an orphaned one identifiable. Best-effort: failure is ignored.

@@ -4,6 +4,7 @@
 #include "version.h"
 
 #include <cctype>
+#include <set>
 #include <sstream>
 
 namespace rasync {
@@ -28,14 +29,36 @@ bool is_peer_id(const std::string& s) {
 
 } // namespace
 
+bool valid_folder_name(const std::string& name, std::string& why) {
+    if (name.empty())      { why = "a folder name may not be empty"; return false; }
+    // The name is length-prefixed with a u16 on the wire; well before that limit
+    // it stops being something anyone would type.
+    if (name.size() > 255) { why = "folder name is too long (255 bytes max)"; return false; }
+    for (unsigned char c : name) {
+        if (c < 0x20 || c == 0x7f) {
+            why = "folder name contains a control character";
+            return false;
+        }
+    }
+    if (name.front() == ' ' || name.back() == ' ') {
+        // Both peers must produce the same bytes, and a name that ends in a space
+        // is one the other side will type without it.
+        why = "folder name has leading or trailing whitespace";
+        return false;
+    }
+    return true;
+}
+
 std::string help_text(const std::string& prog) {
     using namespace term;
     std::ostringstream o;
     o << bold(cyan("rasync")) << " " << kVersion
       << " — real-time two-way directory sync over P2P\n\n";
     o << bold("USAGE\n");
-    o << "  " << prog << " [options] " << bold("<directory>") << "\n\n";
-    o << bold("CONNECTION\n");
+    o << "  " << prog << " [options] " << bold("<directory>") << " [[options] " << bold("<directory>") << "]...\n\n";
+    o << "  Folder options apply to the directory they follow; given before the\n";
+    o << "  first directory they are the default for every folder.\n\n";
+    o << bold("CONNECTION") << dim("  (node-wide — one connection carries every folder)\n");
     o << "  " << green("-p, --port") << " <n>         listen on TCP port <n> (default: ephemeral)\n";
     o << "  " << green("    --peer") << " <host:port>  dial a specific peer (repeatable)\n";
     o << "  " << green("    --key") << " <secret>      shared secret: peers must match it to connect\n";
@@ -43,7 +66,10 @@ std::string help_text(const std::string& prog) {
     o << "  " << green("    --allow") << " <peer-id>    only sync with this peer id (64 hex, repeatable)\n";
     o << "  " << green("    --discover") << "           enable DHT + mDNS discovery without a key\n";
     o << "  " << green("    --lan") << "                discover on the local network only (mDNS)\n\n";
-    o << bold("SYNC BEHAVIOUR\n");
+    o << bold("FOLDER") << dim("  (applies to the directory it follows)\n");
+    o << "  " << green("    --name") << " <label>      the name both peers know this folder by\n";
+    o << "                            (default: the directory's own leaf name; both\n";
+    o << "                             sides must agree or the folder never pairs)\n";
     o << "  " << green("    --mirror") << "             one-way mirror instead of two-way merge\n";
     o << "  " << green("    --source") << " / " << green("--replica") << "  mirror role (source is authoritative)\n";
     o << "  " << green("    --conflict") << " <policy>  newer|larger|local|remote (default: newer)\n";
@@ -59,7 +85,7 @@ std::string help_text(const std::string& prog) {
     o << "  " << green("    --once") << "               reconcile once with connected peers, then exit\n";
     o << "  " << green("    --data-dir") << " <path>    keep sync state here instead of in the\n";
     o << "                            per-user state directory (nothing of rasync's\n";
-    o << "                            is stored in the synced folder by default)\n\n";
+    o << "                            is stored in a synced folder by default)\n\n";
     o << bold("OUTPUT\n");
     o << "  " << green("-v, --verbose") << "            show every file operation\n";
     o << "  " << green("-q, --quiet") << "              only warnings and errors\n";
@@ -74,6 +100,12 @@ std::string help_text(const std::string& prog) {
     o << dim("  # Both hosts: find each other automatically, and only each other,\n");
     o << dim("  # by a shared secret (a peer without it cannot even handshake)\n");
     o << "  " << prog << " --key s3cr3t-passphrase ./data\n";
+    o << dim("  # Several folders over one connection\n");
+    o << "  " << prog << " --key s3cr3t ./documents ./photos ./code\n";
+    o << dim("  # …where the other machine keeps them under different paths\n");
+    o << "  " << prog << " --key s3cr3t ~/Docs --name documents ~/Pictures --name photos\n";
+    o << dim("  # Two-way for one folder, one-way backup for another\n");
+    o << "  " << prog << " --key s3cr3t ./work ./archive --mirror --source\n";
     o << dim("  # One-way backup mirror (source pushes, replica follows)\n");
     o << "  " << prog << " --mirror --source -p 9000 ./data      " << dim("(on the source)") << "\n";
     o << "  " << prog << " --mirror --replica --peer host:9000 ./backup\n";
@@ -90,7 +122,15 @@ ParseResult parse_args(int argc, char** argv) {
         return res;
     };
 
-    std::vector<std::string> positionals;
+    // Folder options seen before the first directory. Every directory starts as a
+    // copy of this, so "rasync --conflict larger a b" configures both.
+    FolderOptions defaults;
+    // The folder currently being described: the last directory on the line, or
+    // `defaults` while there is none.
+    auto current = [&]() -> FolderOptions& {
+        return o.folders.empty() ? defaults : o.folders.back();
+    };
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
@@ -124,21 +164,34 @@ ParseResult parse_args(int argc, char** argv) {
         }
         else if (arg == "--discover")              o.discover = true;
         else if (arg == "--lan")                 { o.lan_only = true; o.discover = true; }
-        else if (arg == "--mirror")                o.mode = SyncMode::Mirror;
-        else if (arg == "--source")                o.source = true;
-        else if (arg == "--replica")               o.replica = true;
+        // — folder-scoped from here down —
+        else if (arg == "--name") {
+            std::string name = next(arg);
+            if (res.action == ParseResult::Error) return res;
+            // A name identifies one folder, so unlike the others it cannot sensibly
+            // be a default: two folders sharing a name are two peers' worth of
+            // traffic routed into one tree.
+            if (o.folders.empty())
+                return fail("--name must follow a directory (it names that folder)");
+            std::string why;
+            if (!valid_folder_name(name, why)) return fail(why + ": '" + name + "'");
+            current().name = name;
+        }
+        else if (arg == "--mirror")                current().mode = SyncMode::Mirror;
+        else if (arg == "--source")                current().source = true;
+        else if (arg == "--replica")               current().replica = true;
         else if (arg == "--conflict") {
             std::string c = next(arg);
-            if (c == "newer") o.conflict = ConflictPolicy::Newer;
-            else if (c == "larger") o.conflict = ConflictPolicy::Larger;
-            else if (c == "local") o.conflict = ConflictPolicy::PreferLocal;
-            else if (c == "remote") o.conflict = ConflictPolicy::PreferRemote;
+            if (c == "newer") current().conflict = ConflictPolicy::Newer;
+            else if (c == "larger") current().conflict = ConflictPolicy::Larger;
+            else if (c == "local") current().conflict = ConflictPolicy::PreferLocal;
+            else if (c == "remote") current().conflict = ConflictPolicy::PreferRemote;
             else return fail("unknown --conflict policy: " + c);
         }
-        else if (arg == "--no-delete")             o.no_delete = true;
-        else if (arg == "--no-delta")              o.no_delta = true;
-        else if (arg == "--ignore")                o.ignores.push_back(next(arg));
-        else if (arg == "--ignore-file")           o.ignore_file = next(arg);
+        else if (arg == "--no-delete")             current().no_delete = true;
+        else if (arg == "--no-delta")              current().no_delta = true;
+        else if (arg == "--ignore")                current().ignores.push_back(next(arg));
+        else if (arg == "--ignore-file")           current().ignore_file = next(arg);
         else if (arg == "--interval") {
             unsigned long s = 0;
             if (!parse_uint(next(arg), s) || s == 0) return fail("invalid --interval");
@@ -150,23 +203,40 @@ ParseResult parse_args(int argc, char** argv) {
         else if (arg == "-v" || arg == "--verbose") o.verbosity = 2;
         else if (arg == "-q" || arg == "--quiet")   o.verbosity = 0;
         else if (!arg.empty() && arg[0] == '-')     return fail("unknown option: " + arg);
-        else                                        positionals.push_back(arg);
+        else {
+            // A directory opens a new folder, inheriting whatever was set before the
+            // first one — never anything scoped to a previous directory.
+            FolderOptions f = defaults;
+            f.directory = arg;
+            o.folders.push_back(std::move(f));
+        }
 
         if (res.action == ParseResult::Error) return res;
     }
 
-    if (positionals.empty()) return fail("missing <directory> to sync");
-    if (positionals.size() > 1) return fail("expected a single <directory>, got " +
-                                            std::to_string(positionals.size()));
-    o.directory = positionals.front();
+    if (o.folders.empty()) return fail("missing <directory> to sync");
 
-    // Validate mirror role coherence.
-    if (o.mode == SyncMode::Mirror && !o.source && !o.replica)
-        return fail("--mirror requires --source or --replica");
-    if (o.source && o.replica)
-        return fail("--source and --replica are mutually exclusive");
-    if (o.mode == SyncMode::TwoWay && (o.source || o.replica))
-        return fail("--source/--replica only apply with --mirror");
+    for (const auto& f : o.folders) {
+        const std::string label = f.name.empty() ? f.directory : f.name;
+        if (f.mode == SyncMode::Mirror && !f.source && !f.replica)
+            return fail("--mirror requires --source or --replica (" + label + ")");
+        if (f.source && f.replica)
+            return fail("--source and --replica are mutually exclusive (" + label + ")");
+        if (f.mode == SyncMode::TwoWay && (f.source || f.replica))
+            return fail("--source/--replica only apply with --mirror (" + label + ")");
+    }
+
+    // Two folders under one name would route both peers' traffic for that name
+    // into whichever service was registered first. Only explicit names can be
+    // checked here; a collision between two *default* names is a collision
+    // between directory leaves, which needs the resolved paths and is caught in
+    // the daemon.
+    std::set<std::string> named;
+    for (const auto& f : o.folders) {
+        if (f.name.empty()) continue;
+        if (!named.insert(f.name).second)
+            return fail("two folders share the name '" + f.name + "'");
+    }
 
     return res;
 }

@@ -29,25 +29,34 @@ void hide_from_listings(const std::string& path) {
 #endif
 }
 
-} // namespace
-
-SyncService::SyncService(librats::Node& node, SyncConfig config, SyncEvents events)
-    : node_(node), config_(std::move(config)), events_(std::move(events)) {
+/// Fill in the parts of a config the caller left to us, so the tag can be derived
+/// in the member initialiser list (which runs before the constructor body).
+SyncConfig with_defaults(SyncConfig config) {
     // Default the state out of the synced tree: the tree is the user's, and
     // anything rasync leaves there is clutter it has to clean up later.
-    if (config_.data_dir.empty())
-        config_.data_dir = state_dir_for(config_.root);
+    if (config.data_dir.empty()) config.data_dir = state_dir_for(config.root);
+    if (config.folder.empty())   config.folder   = default_folder_name(config.root);
+    return config;
 }
+
+} // namespace
+
+std::string default_folder_name(const std::string& root) {
+    std::filesystem::path p(root);
+    std::string leaf = p.filename().string();
+    // A trailing separator ("/srv/data/") puts the leaf in the parent slot.
+    if (leaf.empty()) leaf = p.parent_path().filename().string();
+    // Only a filesystem root ("/", "C:\") gets this far with nothing to name it.
+    return leaf.empty() ? std::string("rasync") : leaf;
+}
+
+SyncService::SyncService(librats::Node& node, SyncConfig config, SyncEvents events)
+    : node_(node),
+      config_(with_defaults(std::move(config))),
+      events_(std::move(events)),
+      tag_(proto::folder_tag(config_.folder)) {}
 
 SyncService::~SyncService() { shutdown(); }
-
-void SyncService::attach() {
-    node_.on(proto::kChannel, [this](const librats::Peer& peer, librats::ByteView payload) {
-        on_message(peer.id(), payload);
-    });
-    node_.on_peer_connected([this](const librats::Peer& peer) { on_peer_up(peer.id()); });
-    node_.on_peer_disconnected([this](const librats::PeerId& id) { on_peer_down(id); });
-}
 
 void SyncService::load_baseline() {
     std::string path = librats::combine_paths(config_.data_dir, "baseline.man");
@@ -189,24 +198,35 @@ bool SyncService::peer_allowed(const librats::PeerId& id) const {
     return config_.allowed_peers.empty() || config_.allowed_peers.count(id) != 0;
 }
 
-void SyncService::on_peer_up(const librats::PeerId& id) {
+void SyncService::send_hello(const librats::PeerId& to) {
+    auto w = proto::message(tag_, proto::Op::Hello);
+    w.u8(proto::kVersion);
+    w.u8(static_cast<uint8_t>(config_.mode));
+    w.u8(static_cast<uint8_t>(config_.conflict));
+    w.str16(config_.folder);
+    send(to, w.buffer());
+}
+
+void SyncService::peer_connected(const librats::PeerId& id) {
     if (stopped_) return;
     if (!peer_allowed(id)) {
         // Reported once, here, rather than per dropped message: the connection
         // itself is librats' to keep or close, and it will sit there idle. What
-        // matters is that no session exists, so nothing of the tree is ever
-        // described or served to it.
-        log(2, "peer " + id.to_hex() + " is not in the allow-list — ignoring it");
+        // matters is that we never name this folder to it, never describe the
+        // tree, and never serve a request.
+        log(2, "peer " + id.to_hex() + " is not in the allow-list — not offering '" +
+               config_.folder + "'");
         return;
     }
-    session_for(id);
-    if (events_.peer_up) events_.peer_up(id);
+    // Announce the folder, but create nothing. A session owns two threads and a
+    // transfer's worth of state; spending that on every (folder, peer) pair would
+    // cost most of it on pairs that share no folder at all. The peer answers a
+    // Hello it recognises, and *that* is what brings a session into being — so
+    // the cost tracks folders actually shared, not folders configured.
+    send_hello(id);
 }
 
-void SyncService::on_peer_down(const librats::PeerId& id) {
-    // Symmetric with on_peer_up: a peer we never counted as up must not be
-    // reported down, or the UI's peer count drifts negative.
-    if (!peer_allowed(id)) return;
+void SyncService::peer_disconnected(const librats::PeerId& id) {
     std::shared_ptr<SyncSession> session;
     {
         std::lock_guard<std::mutex> lk(sessions_mutex_);
@@ -214,14 +234,13 @@ void SyncService::on_peer_down(const librats::PeerId& id) {
         if (it != sessions_.end()) { session = it->second; sessions_.erase(it); }
     }
     if (session) session->stop();
-    if (events_.peer_down) events_.peer_down(id);
 }
 
-void SyncService::on_message(const librats::PeerId& from, librats::ByteView payload) {
+void SyncService::handle_message(const librats::PeerId& from, proto::Op op, BinaryReader& body) {
     // Dropped silently: a disallowed peer is free to keep talking, and one log
     // line per message it sends would be its own denial of service.
     if (!peer_allowed(from)) return;
-    if (auto session = session_for(from)) session->handle(payload);
+    if (auto session = session_for(from)) session->handle(op, body);
 }
 
 void SyncService::shutdown() {

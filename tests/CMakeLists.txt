@@ -44,3 +44,13 @@ if(TARGET rasync_net AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_sync_integratio
     target_link_libraries(rasync_net_tests PRIVATE rasync_net GTest::gtest_main)
     gtest_discover_tests(rasync_net_tests DISCOVERY_TIMEOUT 60)
 endif()
+
+# ── CLI + terminal tests (need the app layer, but no networking) ─────────────
+if(TARGET rasync_app)
+    add_executable(rasync_app_tests
+        test_cli.cpp
+    )
+    target_include_directories(rasync_app_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(rasync_app_tests PRIVATE rasync_app GTest::gtest_main)
+    gtest_discover_tests(rasync_app_tests DISCOVERY_TIMEOUT 60)
+endif()

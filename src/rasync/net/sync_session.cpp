@@ -150,7 +150,8 @@ void SyncSession::start() {
     if (!running_.compare_exchange_strong(expected, true)) return;
     sender_ = std::thread([this] { sender_loop(); });
     requester_ = std::thread([this] { requester_loop(); });
-    send_hello();
+    // No Hello here: the service already sent one when the peer connected, which
+    // is what let this session be created only for a peer that answered it.
 }
 
 void SyncSession::stop() {
@@ -174,11 +175,8 @@ void SyncSession::stop() {
 
 // ── inbound dispatch (reactor thread) ────────────────────────────────────────
 
-void SyncSession::handle(librats::ByteView payload) {
+void SyncSession::handle(proto::Op op, BinaryReader& r) {
     if (incompatible_.load()) return;  // nothing this peer says can be acted on
-    BinaryReader r(payload.data(), payload.size());
-    auto op = static_cast<proto::Op>(r.u8());
-    if (!r.ok()) return;
     switch (op) {
         case proto::Op::Hello:          handle_hello(r); break;
         case proto::Op::ManifestUpdate: handle_manifest_update(r); break;
@@ -199,19 +197,15 @@ void SyncSession::handle(librats::ByteView payload) {
 
 void SyncSession::send_msg(BinaryWriter& w) { service_.send(peer_, w.buffer()); }
 
-void SyncSession::send_hello() {
-    const auto& cfg = service_.config();
-    auto w = proto::message(proto::Op::Hello);
-    w.u8(proto::kVersion);
-    w.u8(static_cast<uint8_t>(cfg.mode));
-    w.u8(static_cast<uint8_t>(cfg.conflict));
-    send_msg(w);
+BinaryWriter SyncSession::msg(proto::Op op) const {
+    return proto::message(service_.tag(), op);
 }
 
 void SyncSession::handle_hello(BinaryReader& r) {
-    uint8_t version = r.u8();
-    auto    peer_mode = static_cast<SyncMode>(r.u8());
-    uint8_t peer_conflict = r.u8();
+    uint8_t     version = r.u8();
+    auto        peer_mode = static_cast<SyncMode>(r.u8());
+    uint8_t     peer_conflict = r.u8();
+    std::string peer_folder = r.str16();
     if (!r.ok()) return;
 
     // Go inert and say so once. A peer we cannot converge with is worse than no
@@ -222,7 +216,7 @@ void SyncSession::handle_hello(BinaryReader& r) {
     auto refuse = [&](const std::string& why) {
         service_.log(2, why + " — not syncing with this peer");
         incompatible_.store(true);
-        auto w = proto::message(proto::Op::Bye);
+        auto w = msg(proto::Op::Bye);
         send_msg(w);
     };
 
@@ -232,6 +226,17 @@ void SyncSession::handle_hello(BinaryReader& r) {
         // advertisement and never converge.
         refuse("peer speaks protocol v" + std::to_string(version) +
                ", we speak v" + std::to_string(proto::kVersion));
+        return;
+    }
+
+    if (peer_folder != service_.config().folder) {
+        // The tag routed this message here, and the tag is 32 bits of a hash over
+        // the name — so two unrelated folders can, with vanishing probability,
+        // claim the same one. The name settles it. Without this check that
+        // collision would merge two different trees into each other, which is the
+        // one failure this protocol must never have; with it, it costs a log line.
+        refuse("peer's folder '" + peer_folder + "' collides with our '" +
+               service_.config().folder + "' but is not the same folder (rename one)");
         return;
     }
 
@@ -345,7 +350,7 @@ void SyncSession::send_update_locked(const ManifestPatch& patch, bool reset) {
         uint8_t flags = 0;
         if (first && reset) flags |= proto::kUpdateReset;
         if (more)           flags |= proto::kUpdateMore;
-        auto w = proto::message(proto::Op::ManifestUpdate);
+        auto w = msg(proto::Op::ManifestUpdate);
         w.u8(flags);
         chunk.encode(w);
         service_.note_advert_sent(w.size());
@@ -456,7 +461,7 @@ void SyncSession::requester_loop() {
 
 void SyncSession::send_request(const std::string& rel_path) {
     const auto& cfg = service_.config();
-    auto w = proto::message(proto::Op::Request);
+    auto w = msg(proto::Op::Request);
     w.str16(rel_path);
 
     // A signature lets the peer answer with a delta. It is only worth building if
@@ -550,7 +555,7 @@ void SyncSession::handle_request(BinaryReader& r) {
     // stops requesting anything at all.
     auto decline = [&](const std::string& why) {
         service_.log(2, "declining request for " + job.rel_path + ": " + why);
-        auto w = proto::message(proto::Op::NotFound);
+        auto w = msg(proto::Op::NotFound);
         w.str16(job.rel_path);
         send_msg(w);
     };
@@ -591,7 +596,7 @@ void SyncSession::sender_loop() {
 void SyncSession::serve_one(const Serve& job) {
     std::string abs = service_.abs_path(job.rel_path);
     if (!librats::file_exists(abs)) {
-        auto w = proto::message(proto::Op::NotFound);
+        auto w = msg(proto::Op::NotFound);
         w.str16(job.rel_path);
         send_msg(w);
         return;
@@ -623,12 +628,12 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
                               uint64_t size, int64_t mtime, uint32_t mode) {
     librats::FileStream in;
     if (!in.open_read(abs.c_str())) {
-        auto w = proto::message(proto::Op::NotFound);
+        auto w = msg(proto::Op::NotFound);
         w.str16(job.rel_path);
         send_msg(w);
         return;
     }
-    auto start = proto::message(proto::Op::FileStart);
+    auto start = msg(proto::Op::FileStart);
     start.u64(job.xid); start.str16(job.rel_path);
     start.u64(size); start.i64(mtime); start.u32(mode); start.u8(0);
     send_msg(start);
@@ -641,7 +646,7 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
         size_t n = in.read(buf.data(), chunk);
         if (n == 0) break;
         sha256_update(&hash, buf.data(), n);
-        auto w = proto::message(proto::Op::FileLiteral);
+        auto w = msg(proto::Op::FileLiteral);
         w.u64(job.xid); w.blob32(buf.data(), n);
         send_msg(w);
         note_sent(job.xid, n);
@@ -651,7 +656,7 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
         if (n < chunk) break;
     }
     Hash digest{}; sha256_finish(&hash, digest.data());
-    auto end = proto::message(proto::Op::FileEnd);
+    auto end = msg(proto::Op::FileEnd);
     end.u64(job.xid); end.bytes(digest);
     send_msg(end);
 
@@ -676,7 +681,7 @@ void SyncSession::serve_delta(const Serve& job, const std::string& abs,
     Delta delta = compute_delta(job.sig, data, sz);
     Hash digest = sha256(data, sz);
 
-    auto start = proto::message(proto::Op::FileStart);
+    auto start = msg(proto::Op::FileStart);
     start.u64(job.xid); start.str16(job.rel_path);
     start.u64(sz); start.i64(mtime); start.u32(mode); start.u8(1);
     send_msg(start);
@@ -686,14 +691,14 @@ void SyncSession::serve_delta(const Serve& job, const std::string& abs,
     for (const auto& op : delta.ops) {
         if (!running_.load()) return;
         if (op.copy) {
-            auto w = proto::message(proto::Op::FileCopy);
+            auto w = msg(proto::Op::FileCopy);
             w.u64(job.xid); w.u64(op.offset); w.u32(op.len);
             send_msg(w);
         } else {
             // Chunk large literal runs so one message never dominates the window.
             for (size_t off = 0; off < op.literal.size(); off += chunk) {
                 size_t n = std::min<size_t>(chunk, op.literal.size() - off);
-                auto w = proto::message(proto::Op::FileLiteral);
+                auto w = msg(proto::Op::FileLiteral);
                 w.u64(job.xid); w.blob32(op.literal.data() + off, n);
                 send_msg(w);
                 note_sent(job.xid, n);
@@ -702,7 +707,7 @@ void SyncSession::serve_delta(const Serve& job, const std::string& abs,
             }
         }
     }
-    auto end = proto::message(proto::Op::FileEnd);
+    auto end = msg(proto::Op::FileEnd);
     end.u64(job.xid); end.bytes(digest);
     send_msg(end);
 
@@ -812,7 +817,7 @@ void SyncSession::handle_file_literal(BinaryReader& r) {
     // COPY bytes it never sent) would run its counter backwards.
     if (in->on_wire - in->last_ack >= kAckInterval) {
         in->last_ack = in->on_wire;
-        auto w = proto::message(proto::Op::FileAck);
+        auto w = msg(proto::Op::FileAck);
         w.u64(xid); w.u64(in->on_wire);
         send_msg(w);
     }
@@ -871,7 +876,7 @@ void SyncSession::handle_file_end(BinaryReader& r) {
         fail_incoming(in, "hash mismatch", /*keep_reservation=*/retry);
         if (retry) {
             service_.log(2, "delta verify failed for " + path + " — retrying whole-file");
-            auto w = proto::message(proto::Op::Request);
+            auto w = msg(proto::Op::Request);
             w.str16(path); w.u8(0);
             send_msg(w);
         }
@@ -884,7 +889,7 @@ void SyncSession::handle_file_end(BinaryReader& r) {
 void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
     // Ack every wire byte so the sender's window drains cleanly.
     {
-        auto w = proto::message(proto::Op::FileAck);
+        auto w = msg(proto::Op::FileAck);
         w.u64(in->xid); w.u64(in->on_wire);
         send_msg(w);
     }

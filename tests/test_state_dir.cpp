@@ -114,3 +114,19 @@ TEST(StateDir, OwnerMarkerNamesTheSyncedDirectory) {
     record_state_owner(state.str(), "/home/u/data");
     EXPECT_EQ(test::read_file(state.sub("directory.txt")), "/home/u/data\n");
 }
+
+TEST(StateDir, NodeStateIsNotAnyFolderState) {
+    // One process syncs many folders over one node, so its identity cannot live
+    // in a folder's directory: the peer id would then depend on which directory
+    // was named first on the command line.
+    ScopedStateHome home;
+    test::TempDir tree_a, tree_b;
+
+    const std::string node = node_state_dir();
+    EXPECT_FALSE(node.empty());
+    EXPECT_NE(node, state_dir_for(tree_a.str()));
+    EXPECT_NE(node, state_dir_for(tree_b.str()));
+    EXPECT_NE(node.find(home.dir.str()), std::string::npos);
+    // And it does not move when the folders do.
+    EXPECT_EQ(node, node_state_dir());
+}

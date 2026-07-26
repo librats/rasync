@@ -2,13 +2,19 @@
 
 /**
  * @file sync_service.h
- * @brief Ties librats' Node to rasync's per-peer SyncSessions.
+ * @brief One synced folder: its manifests, and a SyncSession per peer sharing it.
  *
- * SyncService is the application-side glue: it registers the rasync channel and
- * peer up/down handlers on a librats Node (before start()), owns the authoritative
- * local + baseline manifests, and spins up one SyncSession per connected peer. The
- * daemon feeds it fresh manifests after each scan; it fans those out to the
- * sessions, which do the actual reconcile + transfer.
+ * SyncService is the application-side glue for a *single* folder: it owns the
+ * authoritative local + baseline manifests and spins up one SyncSession per peer
+ * that turns out to share the folder. The daemon feeds it fresh manifests after
+ * each scan; it fans those out to the sessions, which do the actual reconcile +
+ * transfer.
+ *
+ * It does not touch the librats Node's handlers — a node carries every folder at
+ * once, so registering the channel and the peer up/down callbacks belongs to
+ * SyncRouter (net/sync_router.h), which owns the services and hands each one the
+ * traffic tagged for it. The service still holds a Node reference, because
+ * sending is per-peer and needs one.
  *
  * Everything the sessions need from the outside world — sending on the channel,
  * reading the current manifests, persisting the baseline, reporting progress —
@@ -46,7 +52,17 @@ constexpr const char* kTempDirName = ".rasync-tmp";
 /// Everything that shapes how one directory is synced.
 struct SyncConfig {
     std::string    root;                 ///< absolute path of the synced directory
-    std::string    data_dir;             ///< rasync state (baseline, identity); see core/state_dir.h
+    std::string    data_dir;             ///< rasync state (baseline); see core/state_dir.h
+
+    /// The folder's name, as *both* peers know it. This is the only thing that
+    /// says "your D:\docs and my /home/me/docs are the same tree": local paths
+    /// differ between machines, so they cannot be it. It is hashed into the
+    /// routing tag every message carries (proto::folder_tag) and sent verbatim in
+    /// Hello, where the peer checks it. Two peers that name one folder
+    /// differently simply never meet on it — each logs the other's name as a
+    /// folder it does not have. Defaults to the directory's own leaf name.
+    std::string    folder;
+
     SyncMode       mode              = SyncMode::TwoWay;
     ConflictPolicy conflict          = ConflictPolicy::Newer;
     bool           source            = false;   ///< mirror mode: this side is authoritative
@@ -89,11 +105,13 @@ struct TransferInfo {
     uint64_t    on_wire = 0;    ///< bytes that actually crossed the network
 };
 
-/// UI hooks. All are optional; all fire from librats reactor / session threads,
-/// so a handler must be quick and thread-safe.
+/// Per-folder UI hooks. All are optional; all fire from librats reactor / session
+/// threads, so a handler must be quick and thread-safe.
+///
+/// Peer up/down is deliberately absent: a connection is node-level and carries
+/// every folder, so reporting it per folder would count one peer N times. It
+/// lives on RouterEvents (net/sync_router.h) instead.
 struct SyncEvents {
-    std::function<void(const librats::PeerId&)>                    peer_up;
-    std::function<void(const librats::PeerId&)>                    peer_down;
     std::function<void(const librats::PeerId&, const SyncPlan&)>   round;
     std::function<void(const TransferInfo&)>                       file_done;
     std::function<void(const librats::PeerId&, uint64_t files, uint64_t bytes)> synced;
@@ -102,16 +120,40 @@ struct SyncEvents {
 
 class SyncSession;  // net/sync_session.h
 
+/// The folder name a directory gets when the user does not choose one: the
+/// directory's own leaf. Convenient, and right whenever both machines happen to
+/// call the tree the same thing — which is why a mismatch has to be *reported*
+/// rather than silently produce two folders that never meet (see SyncRouter).
+std::string default_folder_name(const std::string& root);
+
 class SyncService {
 public:
+    /// `config.folder` defaults to default_folder_name(config.root) when empty.
     SyncService(librats::Node& node, SyncConfig config, SyncEvents events = {});
     ~SyncService();
 
     SyncService(const SyncService&) = delete;
     SyncService& operator=(const SyncService&) = delete;
 
-    /// Register channel + peer handlers on the node. Call BEFORE node.start().
-    void attach();
+    /// The folder's shared name and the routing tag derived from it. The tag is
+    /// fixed at construction because every message carries it and it must not
+    /// change under a live session.
+    const std::string& folder() const noexcept { return config_.folder; }
+    uint32_t           tag()    const noexcept { return tag_; }
+
+    // — driven by SyncRouter, all on the librats reactor thread —
+
+    /// A peer finished the librats handshake. Announces this folder to it (one
+    /// Hello) if the allow-list permits; deliberately creates no session, so a
+    /// peer that does not have this folder costs one message and no threads.
+    void peer_connected(const librats::PeerId& id);
+
+    /// A peer went away: drop and stop its session for this folder, if any.
+    void peer_disconnected(const librats::PeerId& id);
+
+    /// One inbound message for this folder, already stripped of its header
+    /// (proto::kHeaderBytes). `op` is the opcode the router peeled off.
+    void handle_message(const librats::PeerId& from, proto::Op op, BinaryReader& body);
 
     /// Load the persisted baseline (if any) from data_dir. Call once at startup.
     /// data_dir lives outside the synced tree by default (see core/state_dir.h).
@@ -172,16 +214,15 @@ public:
     void        log(int level, const std::string& msg) const;
 
 private:
-    void on_peer_up(const librats::PeerId& id);
-    void on_peer_down(const librats::PeerId& id);
     bool peer_allowed(const librats::PeerId& id) const;  ///< against config_.allowed_peers
-    void on_message(const librats::PeerId& from, librats::ByteView payload);
+    void send_hello(const librats::PeerId& to);
     void notify_sessions();   ///< tell every session the local tree moved
     std::shared_ptr<SyncSession> session_for(const librats::PeerId& id);
 
     librats::Node&   node_;
     SyncConfig       config_;
     SyncEvents       events_;
+    const uint32_t   tag_;    ///< proto::folder_tag(config_.folder)
 
     // Lock order, where both are held: a session's own mutex first, then this one.
     // Nothing here calls back into a session while holding it.

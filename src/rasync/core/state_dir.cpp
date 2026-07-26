@@ -110,6 +110,11 @@ std::string state_dir_for(const std::string& sync_root) {
     return join(join(root, "dirs"), state_dir_name(sync_root));
 }
 
+std::string node_state_dir() {
+    const std::string root = user_state_root();
+    return root.empty() ? std::string() : join(root, "node");
+}
+
 void record_state_owner(const std::string& state_dir, const std::string& sync_root) {
     // A hashed directory name is unreadable on its own; this is what lets a user
     // (or a future cleanup command) tell which tree a state directory belongs to.

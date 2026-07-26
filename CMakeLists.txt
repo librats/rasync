@@ -46,6 +46,7 @@ add_library(rasync_net STATIC
     src/rasync/net/auth.cpp
     src/rasync/net/sync_session.cpp
     src/rasync/net/sync_service.cpp
+    src/rasync/net/sync_router.cpp
 )
 target_link_libraries(rasync_net PUBLIC rasync_core rats)
 endif()
