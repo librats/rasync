@@ -30,7 +30,11 @@ int main(int argc, char** argv) {
             std::cout << help_text(prog);
             return 0;
         case ParseResult::Version:
-            std::cout << "rasync " << kVersion << "\n";
+            // The describe string is what a bug report needs — it names the exact
+            // tree, dirty included — so it goes here rather than in the banner.
+            std::cout << "rasync " << kVersion;
+            if (std::string(kGitDescribe) != "unknown") std::cout << " (" << kGitDescribe << ")";
+            std::cout << "\n";
             return 0;
         case ParseResult::Error:
             term::init(false);

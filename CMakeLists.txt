@@ -1,9 +1,62 @@
 cmake_minimum_required(VERSION 3.15)
 
+# ── version, derived from git ────────────────────────────────────────────────
+# MAJOR.MINOR.PATCH come from the newest reachable tag (`v1.2.3` or `1.2.3`);
+# the fourth component is the commit count, so builds between two tags still
+# order. Nothing is committed: version.h is generated from version.h.in into the
+# build tree. A checkout without git or without tags still configures — it just
+# lands on the fallback below, which is the only version number kept by hand.
+set(RASYNC_FALLBACK_VERSION 0.1.0)
+set(RASYNC_GIT_DESCRIBE  "unknown")
+set(RASYNC_VERSION_BUILD 0)
+
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
+    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE _git_describe OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --abbrev=0
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE _git_tag OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE _git_count OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+
+    if(_git_describe)
+        set(RASYNC_GIT_DESCRIBE ${_git_describe})
+    endif()
+    if(_git_count)
+        set(RASYNC_VERSION_BUILD ${_git_count})
+    endif()
+
+    # The version is baked in at configure time, so a commit has to re-run
+    # configure or the binary keeps reporting the tree it was first built from.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD)
+    endif()
+endif()
+
+if(_git_tag MATCHES "^v?([0-9]+)\\.([0-9]+)\\.([0-9]+)")
+    set(RASYNC_VERSION ${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3})
+else()
+    set(RASYNC_VERSION ${RASYNC_FALLBACK_VERSION})
+endif()
+
 project(rasync
-    VERSION 0.1.0
+    VERSION ${RASYNC_VERSION}
     DESCRIPTION "Real-time two-way directory synchronization over P2P"
     LANGUAGES C CXX)
+
+set(RASYNC_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+set(RASYNC_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+set(RASYNC_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+set(RASYNC_VERSION_STRING "${PROJECT_VERSION}.${RASYNC_VERSION_BUILD}")
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rasync/version.h.in
+    ${PROJECT_BINARY_DIR}/generated/version.h
+    @ONLY)
 
 # ── standards / defaults ─────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
@@ -36,7 +89,9 @@ add_library(rasync_core STATIC
     src/rasync/core/diff.cpp
     src/rasync/core/state_dir.cpp
 )
-target_include_directories(rasync_core PUBLIC src/rasync)
+# The generated dir carries version.h and nothing else; it is PUBLIC so every
+# layer above — and the tests — reach it by the same `#include "version.h"`.
+target_include_directories(rasync_core PUBLIC src/rasync ${PROJECT_BINARY_DIR}/generated)
 # librats gives us SHA-256 + portable filesystem helpers; nothing more.
 target_link_libraries(rasync_core PUBLIC rats)
 
@@ -70,4 +125,4 @@ if(RASYNC_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-message(STATUS "rasync ${PROJECT_VERSION} — tests: ${RASYNC_BUILD_TESTS}")
+message(STATUS "rasync ${RASYNC_VERSION_STRING} (git ${RASYNC_GIT_DESCRIBE}) — tests: ${RASYNC_BUILD_TESTS}")
