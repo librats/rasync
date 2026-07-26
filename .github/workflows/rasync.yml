@@ -1,0 +1,134 @@
+name: rasync CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [created]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every step is plain POSIX sh — Git Bash is present on the Windows runners too,
+# so the matrix needs one implementation of each step instead of three.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.os }} · ${{ matrix.build-type }}
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build-type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out librats
+        # .gitmodules pins the SSH URL and CI has no deploy key, so rewrite it to
+        # HTTPS instead of asking actions/checkout for submodules.
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive
+
+      - name: Set architecture
+        run: echo "ARCH_LOWER=$(echo '${{ runner.arch }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      # tests/CMakeLists.txt prefers this zip over a network fetch, so a warm
+      # cache keeps configure working even when GitHub releases are unreachable.
+      - name: Cache GoogleTest archive
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: googletest-1.17.0
+
+      - name: Fetch GoogleTest archive
+        run: |
+          mkdir -p .cache
+          if [ ! -f .cache/googletest-1.17.0.zip ]; then
+            curl -fsSL -o .cache/googletest-1.17.0.zip \
+              https://github.com/google/googletest/archive/refs/tags/v1.17.0.zip
+          fi
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
+            -DRASYNC_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build-type }} --parallel
+
+      - name: Locate the binary
+        # Single-config generators emit build/bin/rasync; MSVC adds a per-config
+        # subdirectory. Everything downstream uses $RASYNC_BIN.
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "RASYNC_BIN=build/bin/${{ matrix.build-type }}/rasync.exe" >> "$GITHUB_ENV"
+          else
+            echo "RASYNC_BIN=build/bin/rasync" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run tests
+        working-directory: build
+        # The net suite spins up real loopback sessions; give it room to finish.
+        run: ctest --output-on-failure -C ${{ matrix.build-type }} --timeout 600
+
+      - name: Smoke-test the binary
+        run: |
+          "$RASYNC_BIN" --version
+          "$RASYNC_BIN" --help
+
+      # ── packaging (Release only) ────────────────────────────────────────────
+      # rasync ships as an application, not a library: the executable plus the
+      # docs, no headers and no static lib.
+      - name: Stage release files
+        if: matrix.build-type == 'Release'
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   PLATFORM=linux ;;
+            Windows) PLATFORM=windows ;;
+            macOS)   PLATFORM=macos ;;
+          esac
+          echo "PLATFORM=$PLATFORM" >> "$GITHUB_ENV"
+          mkdir -p "dist/$PLATFORM"
+          cp "$RASYNC_BIN" "dist/$PLATFORM/"
+          cp README.md LICENSE "dist/$PLATFORM/"
+
+      - name: Upload build artifacts
+        if: matrix.build-type == 'Release' && github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rasync-${{ env.PLATFORM }}-${{ env.ARCH_LOWER }}-${{ github.sha }}
+          path: dist/${{ env.PLATFORM }}/
+          retention-days: 30
+
+      - name: Package for release
+        if: matrix.build-type == 'Release' && github.event_name == 'release'
+        working-directory: dist
+        run: |
+          NAME="rasync-${PLATFORM}-${ARCH_LOWER}-${{ github.ref_name }}.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$NAME" "$PLATFORM"/*
+          else
+            zip -r "$NAME" "$PLATFORM"/
+          fi
+
+      - name: Upload to release
+        if: matrix.build-type == 'Release' && github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/rasync-${{ env.PLATFORM }}-${{ env.ARCH_LOWER }}-${{ github.ref_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
