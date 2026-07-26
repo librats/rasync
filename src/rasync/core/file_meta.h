@@ -25,8 +25,6 @@ struct FileMeta {
 
     static constexpr uint32_t kExecutable = 0x1;  ///< owner-executable bit
 
-    bool executable() const noexcept { return (mode & kExecutable) != 0; }
-
     /// Same *content*: identical hash and size. mtime/mode deliberately excluded —
     /// a touched-but-unchanged file must not read as different content.
     bool same_content(const FileMeta& o) const noexcept {

@@ -25,17 +25,11 @@ using Hash = std::array<uint8_t, 32>;
 /// Lowercase hex (64 chars) of a hash.
 std::string to_hex(const Hash& h);
 
-/// Parse 64 hex chars into a hash; nullopt if malformed.
-std::optional<Hash> hash_from_hex(const std::string& hex);
-
 /// SHA-256 of an in-memory buffer.
 Hash sha256(const void* data, size_t size);
 inline Hash sha256(const std::string& s) { return sha256(s.data(), s.size()); }
 
 /// SHA-256 of a file's contents, streamed. nullopt if the file cannot be read.
 std::optional<Hash> sha256_file(const std::string& path);
-
-/// The canonical hash of an empty input (handy sentinel / test vector).
-Hash empty_hash();
 
 } // namespace rasync

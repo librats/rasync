@@ -3,8 +3,6 @@
 #include "core/delta.h"
 #include "test_util.h"
 
-#include <cstring>
-
 using namespace rasync;
 
 namespace {
@@ -101,38 +99,6 @@ TEST(Delta, SignatureEncodeDecode) {
         EXPECT_EQ(back->blocks[i].weak, sig.blocks[i].weak);
         EXPECT_EQ(back->blocks[i].strong, sig.blocks[i].strong);
     }
-}
-
-TEST(Delta, DeltaEncodeDecode) {
-    auto base = test::random_bytes(4000, 3);
-    auto target = base;
-    target.insert(target.begin() + 2000, {9, 9, 9, 9});
-    Signature sig = signature_of(base.data(), base.size(), 256);
-    Delta d = compute_delta(sig, target.data(), target.size());
-
-    auto back = Delta::decode(d.encode());
-    ASSERT_TRUE(back.has_value());
-    auto out = apply_delta(base.data(), base.size(), *back);
-    EXPECT_EQ(out, target);
-}
-
-TEST(Delta, ApplyToFiles) {
-    test::TempDir dir;
-    auto base = test::random_bytes(10000, 13);
-    auto target = base;
-    for (size_t i = 100; i < 200; ++i) target[i] = static_cast<uint8_t>(i);
-
-    std::string base_path = dir.sub("base.bin");
-    std::string out_path = dir.sub("out.bin");
-    test::write_file(base_path, base);
-
-    Signature sig = signature_of(base.data(), base.size(), 256);
-    Delta d = compute_delta(sig, target.data(), target.size());
-    ASSERT_TRUE(apply_delta_file(base_path, d, out_path));
-
-    std::string produced = test::read_file(out_path);
-    ASSERT_EQ(produced.size(), target.size());
-    EXPECT_EQ(0, std::memcmp(produced.data(), target.data(), target.size()));
 }
 
 TEST(Delta, WeakChecksumRolls) {

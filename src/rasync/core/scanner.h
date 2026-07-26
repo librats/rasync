@@ -28,16 +28,12 @@ namespace rasync {
 struct ScanStats {
     uint64_t files_seen       = 0;  ///< regular files considered (post-ignore)
     uint64_t files_hashed     = 0;  ///< files actually read + hashed this scan
-    uint64_t bytes_hashed     = 0;  ///< bytes read for hashing this scan
-    uint64_t dirs_seen        = 0;
     uint64_t symlinks_skipped = 0;  ///< links passed over (never followed, never synced)
 };
 
 class Scanner {
 public:
     explicit Scanner(IgnoreList ignore = {}) : ignore_(std::move(ignore)) {}
-
-    const IgnoreList& ignore() const noexcept { return ignore_; }
 
     /// Scan `root` into a manifest. If `previous` is non-null it is used as a
     /// hash cache (size+mtime match ⇒ reuse hash). `stats` (optional) receives

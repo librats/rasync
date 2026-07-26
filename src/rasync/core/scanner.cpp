@@ -78,7 +78,6 @@ Manifest Scanner::scan(const std::string& root,
             // A symlink is skipped wherever it appears — the probe comes after the
             // ignore check so an excluded subtree costs no extra syscalls.
             if (e.is_directory) {
-                ++local.dirs_seen;
                 if (ignore_.matches(rel, /*is_dir=*/true)) continue;
                 // Descending here is what a link back into the tree (or a Windows
                 // junction) turns into an endless walk: loop/, loop/loop/, ...
@@ -108,7 +107,6 @@ Manifest Scanner::scan(const std::string& root,
                 if (!h) continue;  // unreadable (perms / vanished) — skip this file
                 meta.hash = *h;
                 ++local.files_hashed;
-                local.bytes_hashed += meta.size;
             }
 
             out.set(rel, meta);

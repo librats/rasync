@@ -54,9 +54,8 @@ public:
     template <size_t N>
     void bytes(const std::array<uint8_t, N>& a) { raw(a.data(), N); }
 
-    /// Length-prefixed string / blob. Prefix width chosen by the caller.
+    /// Length-prefixed string / blob. u16 for paths, u32 for bulk payloads.
     void str16(const std::string& s) { u16(static_cast<uint16_t>(s.size())); raw(s.data(), s.size()); }
-    void str32(const std::string& s) { u32(static_cast<uint32_t>(s.size())); raw(s.data(), s.size()); }
     void blob32(const void* data, size_t n) { u32(static_cast<uint32_t>(n)); raw(data, n); }
 
     const Bytes& buffer() const noexcept { return buf_; }
@@ -113,7 +112,6 @@ public:
     }
 
     std::string str16() { return read_str(u16()); }
-    std::string str32() { return read_str(u32()); }
 
     /// Read a u32-prefixed blob into a caller-owned vector.
     Bytes blob32() {

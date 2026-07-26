@@ -6,7 +6,7 @@ extern "C" {
 #include "sha256.h"
 }
 
-#include <cstdio>
+#include <vector>
 
 namespace rasync {
 
@@ -18,24 +18,6 @@ std::string to_hex(const Hash& h) {
         out[2 * i + 1] = k[h[i] & 0x0f];
     }
     return out;
-}
-
-std::optional<Hash> hash_from_hex(const std::string& hex) {
-    if (hex.size() != 64) return std::nullopt;
-    auto nibble = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    Hash h{};
-    for (size_t i = 0; i < 32; ++i) {
-        int hi = nibble(hex[2 * i]);
-        int lo = nibble(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0) return std::nullopt;
-        h[i] = static_cast<uint8_t>((hi << 4) | lo);
-    }
-    return h;
 }
 
 Hash sha256(const void* data, size_t size) {
@@ -66,7 +48,5 @@ std::optional<Hash> sha256_file(const std::string& path) {
     sha256_finish(&ctx, h.data());
     return h;
 }
-
-Hash empty_hash() { return sha256("", 0); }
 
 } // namespace rasync

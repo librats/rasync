@@ -58,7 +58,6 @@ TEST(Manifest, FingerprintStableAndSensitive) {
     b.set("x", meta(1, 1, "aaa"));
 
     EXPECT_EQ(a.fingerprint(), b.fingerprint());
-    EXPECT_EQ(a.generation(), b.generation());
 
     b.set("x", meta(1, 999, "aaa"));  // only mtime changed — content identical
     // mtime is folded into the fingerprint via size/mode/hash only; mtime alone

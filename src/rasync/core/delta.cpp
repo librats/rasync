@@ -111,44 +111,6 @@ uint64_t Delta::copied_bytes() const {
     return t;
 }
 
-void Delta::encode(BinaryWriter& w) const {
-    w.u64(out_size);
-    w.u32(static_cast<uint32_t>(ops.size()));
-    for (const auto& op : ops) {
-        w.u8(op.copy ? 1 : 0);
-        if (op.copy) { w.u64(op.offset); w.u32(op.len); }
-        else         { w.blob32(op.literal.data(), op.literal.size()); }
-    }
-}
-
-Bytes Delta::encode() const {
-    BinaryWriter w;
-    encode(w);
-    return w.take();
-}
-
-std::optional<Delta> Delta::decode(BinaryReader& r) {
-    Delta d;
-    d.out_size = r.u64();
-    uint32_t n = r.u32();
-    if (!r.ok()) return std::nullopt;
-    d.ops.reserve(std::min<uint32_t>(n, 1u << 20));
-    for (uint32_t i = 0; i < n; ++i) {
-        DeltaOp op;
-        op.copy = r.u8() != 0;
-        if (op.copy) { op.offset = r.u64(); op.len = r.u32(); }
-        else         { op.literal = r.blob32(); }
-        if (!r.ok()) return std::nullopt;
-        d.ops.push_back(std::move(op));
-    }
-    return d;
-}
-
-std::optional<Delta> Delta::decode(const Bytes& data) {
-    BinaryReader r(data);
-    return decode(r);
-}
-
 // ── delta computation (the rolling-checksum scan) ────────────────────────────
 
 Delta compute_delta(const Signature& sig, const uint8_t* target, size_t size) {
@@ -243,38 +205,6 @@ Bytes apply_delta(const uint8_t* base, size_t base_size, const Delta& delta) {
         }
     }
     return out;
-}
-
-bool apply_delta_file(const std::string& base_path, const Delta& delta,
-                      const std::string& out_path) {
-    librats::FileStream base, out;
-    bool need_base = false;
-    for (const auto& op : delta.ops) if (op.copy) { need_base = true; break; }
-    if (need_base && !base.open_read(base_path.c_str())) return false;
-    if (!out.open_write(out_path.c_str())) return false;
-
-    uint64_t written = 0;
-    std::vector<uint8_t> buf(64 * 1024);
-    for (const auto& op : delta.ops) {
-        if (op.copy) {
-            uint32_t left = op.len;
-            uint64_t off = op.offset;
-            while (left > 0) {
-                size_t want = std::min<size_t>(buf.size(), left);
-                if (!base.seek(off)) return false;
-                size_t got = base.read(buf.data(), want);
-                if (got == 0) return false;
-                if (!out.write_at(written, buf.data(), got)) return false;
-                written += got; off += got; left -= static_cast<uint32_t>(got);
-            }
-        } else {
-            if (!op.literal.empty() &&
-                !out.write_at(written, op.literal.data(), op.literal.size()))
-                return false;
-            written += op.literal.size();
-        }
-    }
-    return true;
 }
 
 } // namespace rasync

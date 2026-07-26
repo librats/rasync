@@ -12,7 +12,6 @@ TEST(Serialize, RoundTripsScalars) {
     w.u64(0x0102030405060708ull);
     w.i64(-42);
     w.str16("hello");
-    w.str32("world!");
 
     BinaryReader r(w.buffer());
     EXPECT_EQ(r.u8(), 0x12);
@@ -21,7 +20,6 @@ TEST(Serialize, RoundTripsScalars) {
     EXPECT_EQ(r.u64(), 0x0102030405060708ull);
     EXPECT_EQ(r.i64(), -42);
     EXPECT_EQ(r.str16(), "hello");
-    EXPECT_EQ(r.str32(), "world!");
     EXPECT_TRUE(r.ok());
     EXPECT_EQ(r.remaining(), 0u);
 }

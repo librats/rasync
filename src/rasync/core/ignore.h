@@ -39,8 +39,6 @@ public:
     /// Load patterns from a file; missing file is not an error (returns false).
     bool add_file(const std::string& path);
 
-    bool empty() const noexcept { return rules_.empty(); }
-
     /// Should `relpath` (POSIX, root-relative, no leading '/') be excluded?
     /// `is_dir` selects whether directory-only patterns apply.
     bool matches(const std::string& relpath, bool is_dir) const;

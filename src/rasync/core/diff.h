@@ -68,22 +68,17 @@ struct SyncPlan {
     bool empty() const {
         return pull.empty() && delete_local.empty() && push.empty() && delete_remote.empty();
     }
-    size_t local_work() const { return pull.size() + delete_local.size(); }
 };
 
 /// Compute this peer's plan. `base` is the last-synced manifest (may be empty on
 /// first sync); ignored in mirror mode.
+///
+/// The new baseline both peers persist afterwards is simply the local manifest at
+/// the moment the plan comes back empty: once there is nothing left to pull or
+/// delete, the two trees agree, so each side's own view *is* the merged result.
 SyncPlan reconcile(const Manifest& base,
                    const Manifest& local,
                    const Manifest& remote,
                    const ReconcileOptions& opts);
-
-/// The manifest both peers should persist as the new baseline after a successful
-/// two-way round: the winning version of every surviving path. Deterministic and
-/// identical on both sides given the same inputs and policy.
-Manifest merged_baseline(const Manifest& base,
-                         const Manifest& local,
-                         const Manifest& remote,
-                         const ReconcileOptions& opts);
 
 } // namespace rasync

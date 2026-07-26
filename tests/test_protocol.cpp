@@ -12,27 +12,28 @@ TEST(Protocol, MessageStartsWithOpcode) {
     EXPECT_EQ(w.buffer()[0], static_cast<uint8_t>(proto::Op::FileStart));
 }
 
-TEST(Protocol, OpNamesCovered) {
-    for (uint8_t i = 1; i <= 12; ++i)
-        EXPECT_STRNE(proto::op_name(static_cast<proto::Op>(i)), "?");
-}
-
 TEST(Protocol, HelloRoundTrip) {
     auto w = proto::message(proto::Op::Hello);
     w.u8(proto::kVersion);
     w.u8(0);           // mode
     w.u8(1);           // conflict
-    w.u64(42);         // base gen
-    w.str16("data");
 
     BinaryReader r(w.buffer());
     EXPECT_EQ(static_cast<proto::Op>(r.u8()), proto::Op::Hello);
     EXPECT_EQ(r.u8(), proto::kVersion);
     EXPECT_EQ(r.u8(), 0);
     EXPECT_EQ(r.u8(), 1);
-    EXPECT_EQ(r.u64(), 42u);
-    EXPECT_EQ(r.str16(), "data");
     EXPECT_TRUE(r.ok());
+}
+
+/// The version is the first thing on the wire, so a peer of any other version is
+/// recognisable before a single field behind it has to make sense.
+TEST(Protocol, VersionIsTheFirstFieldOfHello) {
+    auto w = proto::message(proto::Op::Hello);
+    w.u8(proto::kVersion);
+    BinaryReader r(w.buffer());
+    r.u8();
+    EXPECT_EQ(r.u8(), proto::kVersion);
 }
 
 namespace {

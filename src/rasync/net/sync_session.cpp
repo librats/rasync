@@ -189,9 +189,11 @@ void SyncSession::handle(librats::ByteView payload) {
         case proto::Op::FileEnd:      handle_file_end(r); break;
         case proto::Op::FileAck:      handle_file_ack(r); break;
         case proto::Op::NotFound:     handle_not_found(r); break;
-        case proto::Op::Changed:      advertise(); break;
-        case proto::Op::RequestsDone: maybe_synced(); break;
-        case proto::Op::Bye:          break;
+        // The peer has gone inert. Both sides normally reach that verdict on their
+        // own (every refusal rule is symmetric), so this only matters when the peer
+        // refused us over something we could not see — a malformed Hello of its own,
+        // say. Stop describing our tree to something that will never answer.
+        case proto::Op::Bye:          incompatible_.store(true); break;
     }
 }
 
@@ -203,8 +205,6 @@ void SyncSession::send_hello() {
     w.u8(proto::kVersion);
     w.u8(static_cast<uint8_t>(cfg.mode));
     w.u8(static_cast<uint8_t>(cfg.conflict));
-    w.u64(service_.base_manifest().generation());
-    w.str16(fs::path(cfg.root).filename().string());
     send_msg(w);
 }
 
@@ -212,14 +212,13 @@ void SyncSession::handle_hello(BinaryReader& r) {
     uint8_t version = r.u8();
     auto    peer_mode = static_cast<SyncMode>(r.u8());
     uint8_t peer_conflict = r.u8();
-    r.u64();         // base generation (informational)
-    r.str16();       // name
     if (!r.ok()) return;
 
     // Go inert and say so once. A peer we cannot converge with is worse than no
     // peer: the two sides keep talking and the sync silently never finishes, which
-    // is indistinguishable from a stall. Bye is understood by every version, so the
-    // peer learns of it too.
+    // is indistinguishable from a stall. Bye is a bare opcode every version can
+    // read, so the peer learns of it even when the rest of our messages are not
+    // something it could parse.
     auto refuse = [&](const std::string& why) {
         service_.log(2, why + " — not syncing with this peer");
         incompatible_.store(true);
@@ -228,8 +227,8 @@ void SyncSession::handle_hello(BinaryReader& r) {
     };
 
     if (version != proto::kVersion) {
-        // The shape of a tree description changed in v2, so a mismatched peer's
-        // updates decode as garbage: both sides would log a malformed message per
+        // Versions describe a tree differently, so a mismatched peer's updates
+        // decode as garbage: both sides would log a malformed message per
         // advertisement and never converge.
         refuse("peer speaks protocol v" + std::to_string(version) +
                ", we speak v" + std::to_string(proto::kVersion));
@@ -657,7 +656,7 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
     send_msg(end);
 
     if (service_.events().file_done)
-        service_.events().file_done({TransferInfo::Send, job.rel_path, sent, size, false, sent});
+        service_.events().file_done({TransferInfo::Send, job.rel_path, size, false, sent});
 }
 
 void SyncSession::serve_delta(const Serve& job, const std::string& abs,
@@ -710,7 +709,7 @@ void SyncSession::serve_delta(const Serve& job, const std::string& abs,
     service_.log(0, "sent " + job.rel_path + " as delta (" + std::to_string(on_wire) +
                     " of " + std::to_string(sz) + " bytes on wire)");
     if (service_.events().file_done)
-        service_.events().file_done({TransferInfo::Send, job.rel_path, sz, sz, true, on_wire});
+        service_.events().file_done({TransferInfo::Send, job.rel_path, sz, true, on_wire});
 }
 
 void SyncSession::note_sent(uint64_t xid, uint64_t bytes) {
@@ -817,8 +816,6 @@ void SyncSession::handle_file_literal(BinaryReader& r) {
         w.u64(xid); w.u64(in->on_wire);
         send_msg(w);
     }
-    if (service_.events().progress)
-        service_.events().progress({TransferInfo::Recv, in->rel_path, in->written, in->size, in->is_delta, in->on_wire});
 }
 
 void SyncSession::handle_file_copy(BinaryReader& r) {
@@ -936,7 +933,7 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
 
     service_.log(0, "received " + in->rel_path);
     if (service_.events().file_done)
-        service_.events().file_done({TransferInfo::Recv, in->rel_path, in->written, in->size, in->is_delta, in->on_wire});
+        service_.events().file_done({TransferInfo::Recv, in->rel_path, in->size, in->is_delta, in->on_wire});
 
     maybe_synced();
 }

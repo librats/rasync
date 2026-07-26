@@ -28,7 +28,7 @@
  * as "the peer deleted everything I haven't heard about yet".
  *
  * Message bodies (after the opcode byte):
- *   Hello        [u8 version][u8 mode][u8 conflict][u64 base_gen][str16 name]
+ *   Hello        [u8 version][u8 mode][u8 conflict]
  *   ManifestUpdate [u8 flags]<ManifestPatch::encode>   (see kUpdate* below)
  *   Request      [str16 path][u8 has_sig][ <Signature::encode> if has_sig ]
  *   FileStart    [u64 xid][str16 path][u64 size][i64 mtime][u32 mode][u8 is_delta]
@@ -43,18 +43,15 @@
  *   NotFound     [str16 path]                  (a requested path is gone, or refused:
  *                                            every request is answered, so the asker
  *                                            can free the pull-window slot it holds)
- *   RequestsDone [u64 round]                   (I've sent every request this round)
- *   Changed      [u64 generation]              (my tree changed — start a round)
- *   Bye          (empty)                       (the sender will not sync with you —
- *                                            currently only on a version mismatch)
+ *   Bye          (empty)                       (the sender has gone inert and will
+ *                                            not sync with you; stop talking to it)
  *
- * A peer whose Hello carries a different kVersion is refused outright: v1 and v2
+ * A peer whose Hello carries a different kVersion is refused outright: the versions
  * describe a tree differently, so continuing would mean each side logging a
  * malformed message per advertisement while never converging.
  */
 
 #include <cstdint>
-#include <string>
 
 #include "core/serialize.h"
 
@@ -62,8 +59,10 @@ namespace rasync::proto {
 
 constexpr const char* kChannel = "rasync";
 /// v2: manifests are advertised incrementally (ManifestUpdate replaced the
-/// full-snapshot Manifest message). v1 peers cannot read a v2 tree description.
-constexpr uint8_t     kVersion = 2;
+/// full-snapshot Manifest message). v3: dropped the two opcodes and the two Hello
+/// fields nothing ever sent or read. The version is the first byte of Hello, so a
+/// mismatched peer is recognised and refused before anything else is parsed.
+constexpr uint8_t     kVersion = 3;
 
 /// ManifestUpdate flags.
 constexpr uint8_t kUpdateReset = 0x1;  ///< replaces the receiver's whole view of us
@@ -84,9 +83,7 @@ enum class Op : uint8_t {
     FileEnd        = 7,
     FileAck        = 8,
     NotFound       = 9,
-    RequestsDone   = 10,
-    Changed        = 11,
-    Bye            = 12,
+    Bye            = 10,
 };
 
 /// Begin a message: a writer already carrying the opcode byte.
@@ -95,8 +92,5 @@ inline BinaryWriter message(Op op) {
     w.u8(static_cast<uint8_t>(op));
     return w;
 }
-
-/// Human-readable opcode name (logging/diagnostics).
-const char* op_name(Op op);
 
 } // namespace rasync::proto

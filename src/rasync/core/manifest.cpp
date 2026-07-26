@@ -150,13 +150,6 @@ Hash Manifest::fingerprint() const {
     return h;
 }
 
-uint64_t Manifest::generation() const {
-    Hash h = fingerprint();
-    uint64_t g = 0;
-    for (int i = 0; i < 8; ++i) g = (g << 8) | h[i];
-    return g;
-}
-
 bool Manifest::save(const std::string& path) const {
     Bytes data = encode();
     return librats::create_file_binary(path.c_str(), data.data(), data.size());

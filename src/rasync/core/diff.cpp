@@ -42,59 +42,48 @@ bool local_wins(const FileMeta* L, const FileMeta* R, ConflictPolicy p) {
     }
 }
 
-/// For identical-content paths that differ only in mtime/mode, pick a canonical
-/// survivor so both peers persist the same baseline meta. (mtime is ignored by
-/// content comparison, so the choice never triggers a spurious resync.)
-const FileMeta* canonical(const FileMeta* L, const FileMeta* R) {
-    if (!R) return L;
-    if (!L) return R;
-    if (L->mtime != R->mtime) return L->mtime > R->mtime ? L : R;
-    return L;  // fully identical — either is fine
-}
-
 struct Decision {
     enum Kind { None, Pull, DeleteLocal, Push, DeleteRemote } kind = None;
-    const FileMeta* survivor = nullptr;  ///< surviving meta (nullptr = deleted)
     bool conflict = false;
 };
 
 Decision decide_two_way(const FileMeta* L, const FileMeta* R, const FileMeta* B,
                         const ReconcileOptions& o) {
     if (!L && !R) return {};
-    if (L && R && L->same_content(*R)) return {Decision::None, canonical(L, R), false};
+    if (L && R && L->same_content(*R)) return {Decision::None, false};
 
     const bool lc = changed(classify(L, B));
     const bool rc = changed(classify(R, B));
 
-    if (lc && !rc) return L ? Decision{Decision::Push, L, false}
-                            : Decision{Decision::DeleteRemote, nullptr, false};
+    if (lc && !rc) return L ? Decision{Decision::Push, false}
+                            : Decision{Decision::DeleteRemote, false};
     if (rc && !lc) {
-        if (R) return {Decision::Pull, R, false};
+        if (R) return {Decision::Pull, false};
         // Remote deleted this path. Propagate the deletion, or keep our copy.
-        return o.propagate_deletes ? Decision{Decision::DeleteLocal, nullptr, false}
-                                   : Decision{Decision::None, L, false};
+        return o.propagate_deletes ? Decision{Decision::DeleteLocal, false}
+                                   : Decision{Decision::None, false};
     }
 
     // Both changed (or an inconsistent baseline): a genuine conflict.
     const bool lw = local_wins(L, R, o.conflict);
-    if (lw) return L ? Decision{Decision::Push, L, true}
-                     : Decision{Decision::DeleteRemote, nullptr, true};
-    if (R) return {Decision::Pull, R, true};
-    return o.propagate_deletes ? Decision{Decision::DeleteLocal, nullptr, true}
-                               : Decision{Decision::None, L, true};
+    if (lw) return L ? Decision{Decision::Push, true}
+                     : Decision{Decision::DeleteRemote, true};
+    if (R) return {Decision::Pull, true};
+    return o.propagate_deletes ? Decision{Decision::DeleteLocal, true}
+                               : Decision{Decision::None, true};
 }
 
 Decision decide_mirror(const FileMeta* L, const FileMeta* R, const ReconcileOptions& o) {
     if (o.source) {
-        if (L) return (R && R->same_content(*L)) ? Decision{Decision::None, L, false}
-                                                 : Decision{Decision::Push, L, false};
-        return {Decision::DeleteRemote, nullptr, false};  // replica-only extra
+        if (L) return (R && R->same_content(*L)) ? Decision{Decision::None, false}
+                                                 : Decision{Decision::Push, false};
+        return {Decision::DeleteRemote, false};  // replica-only extra
     }
     // replica
-    if (R) return (L && L->same_content(*R)) ? Decision{Decision::None, R, false}
-                                             : Decision{Decision::Pull, R, false};
-    return o.propagate_deletes ? Decision{Decision::DeleteLocal, nullptr, false}
-                               : Decision{Decision::None, L, false};
+    if (R) return (L && L->same_content(*R)) ? Decision{Decision::None, false}
+                                             : Decision{Decision::Pull, false};
+    return o.propagate_deletes ? Decision{Decision::DeleteLocal, false}
+                               : Decision{Decision::None, false};
 }
 
 Decision decide(const std::string& path, const Manifest& base, const Manifest& local,
@@ -153,16 +142,6 @@ SyncPlan reconcile(const Manifest& base, const Manifest& local,
         if (d.conflict) plan.conflicts.push_back(path);
     }
     return plan;
-}
-
-Manifest merged_baseline(const Manifest& base, const Manifest& local,
-                         const Manifest& remote, const ReconcileOptions& opts) {
-    Manifest out;
-    for (const auto& path : union_keys(base, local, remote)) {
-        Decision d = decide(path, base, local, remote, opts);
-        if (d.survivor) out.set(path, *d.survivor);
-    }
-    return out;
 }
 
 } // namespace rasync

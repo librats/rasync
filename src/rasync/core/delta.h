@@ -64,6 +64,10 @@ struct DeltaOp {
     Bytes    literal;     ///< LITERAL: bytes to append
 };
 
+/// A delta is never serialized as a unit: the sender streams its ops as
+/// individual FileCopy/FileLiteral messages so a huge one never has to fit in a
+/// single message (or in memory twice). Hence no codec here — unlike Signature,
+/// which does travel whole, inside a Request.
 struct Delta {
     uint64_t             out_size = 0;  ///< size of the reconstructed file
     std::vector<DeltaOp> ops;
@@ -72,11 +76,6 @@ struct Delta {
     uint64_t literal_bytes() const;
     /// Bytes reused from the base (sum of copy lengths).
     uint64_t copied_bytes() const;
-
-    void  encode(BinaryWriter& w) const;
-    Bytes encode() const;
-    static std::optional<Delta> decode(BinaryReader& r);
-    static std::optional<Delta> decode(const Bytes& data);
 };
 
 /// Fast rolling (Adler-style) weak checksum of a buffer.
@@ -93,11 +92,9 @@ std::optional<Signature> signature_of_file(const std::string& path,
 Delta compute_delta(const Signature& sig, const uint8_t* target, size_t size);
 
 /// Apply a delta in memory: reconstruct the target from `base` bytes + the delta.
+/// The receiver does this incrementally as ops arrive (see net/sync_session.cpp);
+/// this whole-buffer form is what pins the module's contract down in one line —
+/// `apply_delta(base, compute_delta(signature_of(base), target)) == target`.
 Bytes apply_delta(const uint8_t* base, size_t base_size, const Delta& delta);
-
-/// Apply a delta to files: read COPY ranges from `base_path`, write the result to
-/// `out_path`. Returns false on any I/O error.
-bool apply_delta_file(const std::string& base_path, const Delta& delta,
-                      const std::string& out_path);
 
 } // namespace rasync

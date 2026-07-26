@@ -46,7 +46,7 @@ constexpr const char* kTempDirName = ".rasync-tmp";
 /// Everything that shapes how one directory is synced.
 struct SyncConfig {
     std::string    root;                 ///< absolute path of the synced directory
-    std::string    data_dir;             ///< rasync state (baseline, identity); default <root>/.rasync
+    std::string    data_dir;             ///< rasync state (baseline, identity); see core/state_dir.h
     SyncMode       mode              = SyncMode::TwoWay;
     ConflictPolicy conflict          = ConflictPolicy::Newer;
     bool           source            = false;   ///< mirror mode: this side is authoritative
@@ -79,12 +79,11 @@ struct SyncConfig {
     size_t   max_update_bytes = proto::kMaxUpdateBytes;
 };
 
-/// One in-flight or just-finished file transfer, for the UI.
+/// One finished file transfer, for the UI.
 struct TransferInfo {
     enum Direction { Send, Recv };
     Direction   direction = Recv;
     std::string path;
-    uint64_t    bytes = 0;      ///< transferred so far (of the reconstructed file)
     uint64_t    total = 0;      ///< file size
     bool        delta = false;  ///< sent as an rsync delta
     uint64_t    on_wire = 0;    ///< bytes that actually crossed the network
@@ -96,7 +95,6 @@ struct SyncEvents {
     std::function<void(const librats::PeerId&)>                    peer_up;
     std::function<void(const librats::PeerId&)>                    peer_down;
     std::function<void(const librats::PeerId&, const SyncPlan&)>   round;
-    std::function<void(const TransferInfo&)>                       progress;
     std::function<void(const TransferInfo&)>                       file_done;
     std::function<void(const librats::PeerId&, uint64_t files, uint64_t bytes)> synced;
     std::function<void(int level, const std::string&)>            log;

@@ -59,7 +59,6 @@ public:
 
     void set(const std::string& path, const FileMeta& meta) { entries_[path] = meta; }
     void remove(const std::string& path) { entries_.erase(path); }
-    void clear() { entries_.clear(); }
 
     /// Apply a patch in place. `*this` must be the manifest the patch was diffed
     /// *from* for the result to equal the manifest it was diffed *to*.
@@ -87,10 +86,6 @@ public:
     /// A stable content fingerprint over the whole tree (paths + hashes + sizes +
     /// modes). Two manifests with the same fingerprint describe identical trees.
     Hash fingerprint() const;
-
-    /// A cheap 64-bit "generation" derived from the fingerprint, for lightweight
-    /// "did anything change?" comparisons and log lines.
-    uint64_t generation() const;
 
     // — serialization (identical on the wire and on disk) —
     void  encode(BinaryWriter& w) const;

@@ -159,10 +159,12 @@ cd build
 ctest --output-on-failure
 ```
 
-66 tests cover the codec, hashing, manifests, ignore matching, the delta algorithm,
-the three-way merge, the scanner, the wire protocol, and — end to end — two live
-nodes converging over loopback (initial populate, two-way merge, delta-based
-modification, deletion propagation, and mirror mode).
+113 tests cover the codec, hashing, manifests, ignore matching, the delta algorithm,
+the three-way merge, the scanner, path safety, key derivation, the state directory,
+the wire protocol, and — end to end — two live nodes converging over loopback
+(initial populate, two-way merge, delta-based modification, deletion propagation,
+mirror mode, incremental manifest traffic, access control, and the handshake
+refusals).
 
 ---
 
@@ -344,8 +346,10 @@ node_modules/
 - **Large single files & delta.** Delta reconstruction reads the sender's file into
   memory to run the scan; files above `256 MiB` fall back to whole-file streaming
   (always bounded memory). Everything else streams in fixed windows.
-- **Symlinks and empty directories** are not tracked in this version (regular files
-  only).
+- **Regular files only.** A symlink is skipped, never followed — rasync cannot
+  represent one in a manifest, and following it would either copy data from outside
+  the synced tree or walk in circles. Empty directories are not tracked either; the
+  only ones rasync removes are those its own deletions emptied.
 - Both peers should run with the **same mode** (`two-way` vs `mirror`); rasync warns
   on a mismatch but does not enforce it. Conflict policies, by contrast, **are**
   enforced: they must be complementary (`newer`/`newer`, `larger`/`larger`,

@@ -150,13 +150,12 @@ TEST(Diff, ComplementaryPreferencePoliciesResolveConflictsSymmetrically) {
     EXPECT_TRUE(has(pb.pull, "f"));    // ...and B takes it
     EXPECT_FALSE(has(pb.push, "f"));
 
-    // Both sides must also persist the same survivor, or the next round re-opens
-    // the conflict against divergent baselines.
-    Manifest ma = merged_baseline(base, a, b, oa);
-    Manifest mb = merged_baseline(base, b, a, ob);
-    EXPECT_EQ(ma.fingerprint(), mb.fingerprint());
-    ASSERT_TRUE(ma.find("f"));
-    EXPECT_TRUE(ma.find("f")->same_content(*a.find("f")));
+    // Carrying out that one pull is all it takes: the trees now agree, so the
+    // baseline each side persists (its own local manifest) is the same one.
+    b.set("f", *a.find("f"));
+    EXPECT_EQ(a.fingerprint(), b.fingerprint());
+    EXPECT_TRUE(reconcile(base, a, b, oa).empty());
+    EXPECT_TRUE(reconcile(base, b, a, ob).empty());
 }
 
 TEST(Diff, IdenticalPreferencePoliciesOnBothSidesCannotConverge) {
@@ -178,10 +177,9 @@ TEST(Diff, IdenticalPreferencePoliciesOnBothSidesCannotConverge) {
     EXPECT_TRUE(has(pb.push, "f"));
     EXPECT_TRUE(pa.pull.empty());
     EXPECT_TRUE(pb.pull.empty());
-    // ...and the baselines they would persist disagree, which is the durable half
-    // of the damage.
-    EXPECT_NE(merged_baseline(base, a, b, o).fingerprint(),
-              merged_baseline(base, b, a, o).fingerprint());
+    // Neither plan moves a byte, so the trees are still different — and will be
+    // after every future round, since the inputs never change.
+    EXPECT_NE(a.fingerprint(), b.fingerprint());
 }
 
 TEST(Diff, PolicyNamesMatchTheConflictFlag) {
@@ -191,20 +189,23 @@ TEST(Diff, PolicyNamesMatchTheConflictFlag) {
     EXPECT_STREQ(conflict_policy_name(ConflictPolicy::PreferRemote), "remote");
 }
 
-TEST(Diff, MergedBaselineConverges) {
+// What the session persists as the new baseline is just the local manifest at the
+// moment the plan comes back empty — there is no separate merge step. This is the
+// property that makes that sound: once both sides hold the union, neither has any
+// work left, so either side's own view is already the merged result.
+TEST(Diff, AConvergedTreeLeavesNothingToDo) {
     Manifest base, local, remote;
     base.set("keep", fm("k"));
-    local.set("keep", fm("k"));
-    remote.set("keep", fm("k"));
-    local.set("addedlocal", fm("L"));
-    remote.set("addedremote", fm("R"));
     base.set("delboth", fm("d"));  // deleted on both sides
+    for (Manifest* m : {&local, &remote}) {
+        m->set("keep", fm("k"));
+        m->set("addedlocal", fm("L"));
+        m->set("addedremote", fm("R"));
+    }
 
-    Manifest merged = merged_baseline(base, local, remote, two_way());
-    EXPECT_TRUE(merged.contains("keep"));
-    EXPECT_TRUE(merged.contains("addedlocal"));
-    EXPECT_TRUE(merged.contains("addedremote"));
-    EXPECT_FALSE(merged.contains("delboth"));
+    SyncPlan plan = reconcile(base, local, remote, two_way());
+    EXPECT_TRUE(plan.empty());
+    EXPECT_TRUE(plan.conflicts.empty());
 }
 
 TEST(Diff, MirrorReplicaPullsAndDeletes) {

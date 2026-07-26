@@ -12,20 +12,8 @@ TEST(Hash, KnownVectorAbc) {
 }
 
 TEST(Hash, EmptyVector) {
-    EXPECT_EQ(to_hex(empty_hash()),
+    EXPECT_EQ(to_hex(sha256("", 0)),
               "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-}
-
-TEST(Hash, HexRoundTrip) {
-    Hash h = sha256("the quick brown fox");
-    auto back = hash_from_hex(to_hex(h));
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(*back, h);
-}
-
-TEST(Hash, HexRejectsMalformed) {
-    EXPECT_FALSE(hash_from_hex("tooshort").has_value());
-    EXPECT_FALSE(hash_from_hex(std::string(64, 'z')).has_value());
 }
 
 TEST(Hash, FileMatchesBuffer) {
