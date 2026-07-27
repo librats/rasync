@@ -41,6 +41,11 @@ struct FolderOptions {
     ConflictPolicy conflict = ConflictPolicy::Newer;
     bool           no_delete = false;      ///< don't propagate deletions
     bool           no_delta = false;       ///< disable rsync-style delta transfer
+    /// Read a symbolic link as the file or directory it points at instead of
+    /// skipping it, so a peer with no links of its own receives the structure as
+    /// ordinary files and directories. Local to this side: the peer needs no
+    /// matching flag, and links it holds are its own business.
+    bool           follow_symlinks = false;
 
     std::vector<std::string> ignores;      ///< extra ignore patterns
     std::string              ignore_file;  ///< ignore file (default <dir>/.rasyncignore)

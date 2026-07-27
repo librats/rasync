@@ -100,8 +100,29 @@ void prune_empty_dirs(const std::string& root, const std::string& rel_path) {
     for (fs::path dir = fs::path(rel_path).parent_path(); !dir.empty();
          dir = dir.parent_path()) {
         std::error_code ec;
+        // A directory *link* is never ours to remove: `fs::remove` drops the link
+        // without looking inside it, so the "a non-empty directory is refused"
+        // guarantee this walk rests on does not hold for one. Stop at it and the
+        // tree the user linked to keeps both its contents and its name here.
+        if (fs::is_symlink(fs::symlink_status(root_path / dir, ec))) return;
+        ec.clear();
         if (!fs::remove(root_path / dir, ec) || ec) return;  // not empty, or gone
     }
+}
+
+// Where a file's bytes actually belong. With links followed, a link *is* the file
+// it points at — so an update for one has to land on the target, the way a file
+// inside a linked directory already does (the OS resolves that component for us).
+// Renaming over the link instead would replace it with a copy and silently detach
+// the tree from the data it was pointed at. Non-links, and a run that does not
+// follow links, come back unchanged.
+std::string resolve_link(const std::string& path, bool follow) {
+    if (!follow) return path;
+    std::error_code ec;
+    if (!fs::is_symlink(fs::symlink_status(path, ec))) return path;
+    fs::path real = fs::weakly_canonical(path, ec);
+    if (ec || real.empty()) return path;  // unresolvable: leave it where it was
+    return real.string();
 }
 
 // Move `from` onto `to`, replacing an existing `to`, creating parent dirs.
@@ -109,8 +130,29 @@ bool move_replace(const std::string& from, const std::string& to) {
     std::error_code ec;
     fs::path dst(to);
     if (dst.has_parent_path()) fs::create_directories(dst.parent_path(), ec);
+    ec.clear();
     fs::rename(from, dst, ec);
     if (!ec) return true;
+
+    // Followed links are the one thing that can put the destination on another
+    // filesystem, and no rename crosses one. Copy next to the destination first,
+    // then rename *that* — the swap into place stays atomic even when the bytes
+    // had to cross a boundary to get there. Checked before the retry below, which
+    // deletes the destination and must not run when a rename could never work.
+    if (ec == std::errc::cross_device_link) {
+        fs::path staging = dst;
+        staging += ".rasync-part";
+        fs::remove(staging, ec);
+        ec.clear();
+        fs::copy_file(from, staging, fs::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+        fs::rename(staging, dst, ec);
+        if (ec) { remove_file(to); ec.clear(); fs::rename(staging, dst, ec); }
+        if (ec) { std::error_code ignored; fs::remove(staging, ignored); return false; }
+        remove_file(from);
+        return true;
+    }
+
     // Some platforms won't rename over an existing file — drop it and retry.
     // The old copy can be held open just as briefly, hence the same tolerance.
     remove_file(to);
@@ -897,7 +939,11 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
     in->base.close();
     in->base_open = false;
 
-    if (!move_replace(in->temp_path, in->final_path)) {
+    // A path that is a link locally is the file it points at, not the link — so
+    // the bytes land there, and the link stays a link (see resolve_link).
+    const std::string dst =
+        resolve_link(in->final_path, service_.config().follow_symlinks);
+    if (!move_replace(in->temp_path, dst)) {
         service_.log(2, "cannot move into place: " + in->rel_path);
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -907,7 +953,7 @@ void SyncSession::finalize_incoming(const std::shared_ptr<Incoming>& in) {
         return;
     }
     in->temp_path.clear();  // moved — nothing for the dtor to clean
-    set_mtime(in->final_path, in->mtime);
+    set_mtime(dst, in->mtime);
 
     FileMeta meta;
     meta.size = in->written;

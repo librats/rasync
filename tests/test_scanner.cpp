@@ -7,23 +7,7 @@
 
 using namespace rasync;
 
-namespace {
-
-// Creating a symlink needs Developer Mode or admin rights on Windows. A host
-// without them cannot exercise these paths at all, so the tests skip rather than
-// fail — but they must never pass by silently not creating the link, hence the
-// explicit check that one now exists.
-bool make_symlink(const std::filesystem::path& target,
-                  const std::string& link,
-                  bool directory) {
-    std::error_code ec;
-    if (directory) std::filesystem::create_directory_symlink(target, link, ec);
-    else           std::filesystem::create_symlink(target, link, ec);
-    if (ec) return false;
-    return std::filesystem::is_symlink(std::filesystem::symlink_status(link, ec));
-}
-
-} // namespace
+using rasync::test::make_symlink;
 
 TEST(Scanner, WalksTreeAndHashes) {
     test::TempDir dir;
@@ -152,6 +136,151 @@ TEST(Scanner, SymlinkLoopDoesNotHangTheWalk) {
     EXPECT_EQ(m.size(), 1u);
     EXPECT_TRUE(m.contains("sub/a.txt"));
     EXPECT_EQ(stats.symlinks_skipped, 1u);
+}
+
+// ── --follow-symlinks ────────────────────────────────────────────────────────
+//
+// The opposite bargain: a link stands for what it points at, so the peer receives
+// ordinary files and can rebuild the structure on a platform that has no links.
+// What has to be shown is that content really crosses (including from outside the
+// tree, which is the point), and that the walk still terminates now that the tree
+// is a graph.
+
+TEST(Scanner, FollowedFileSymlinkIsScannedAsItsTarget) {
+    test::TempDir dir;
+    test::write_file(dir.sub("real.txt"), "the real contents");
+    if (!make_symlink("real.txt", dir.sub("link.txt"), /*directory=*/false))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    Scanner sc({}, /*follow_symlinks=*/true);
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    ASSERT_TRUE(m.contains("link.txt"));
+    // Same bytes, same size as the target — not a zero-length reparse point,
+    // which is what the link's own directory entry reports on Windows.
+    EXPECT_EQ(m.find("link.txt")->hash, sha256("the real contents"));
+    EXPECT_EQ(m.find("link.txt")->size, std::string("the real contents").size());
+    EXPECT_EQ(m.find("link.txt")->mtime, m.find("real.txt")->mtime);
+    EXPECT_EQ(m.size(), 2u);
+    EXPECT_EQ(stats.symlinks_followed, 1u);
+    EXPECT_EQ(stats.symlinks_skipped, 0u);
+}
+
+TEST(Scanner, FollowedDirectorySymlinkBringsInATreeFromOutside) {
+    test::TempDir dir, outside;
+    test::write_file(outside.sub("a.txt"), "outside a");
+    test::write_file(outside.sub("deep/b.txt"), "outside b");
+    test::write_file(dir.sub("mine.txt"), "ours");
+    if (!make_symlink(outside.path(), dir.sub("linked"), /*directory=*/true))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    Scanner sc({}, /*follow_symlinks=*/true);
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    // The peer sees a plain subdirectory: this is what lets a machine with no
+    // links of its own end up with the same structure.
+    EXPECT_EQ(m.size(), 3u);
+    EXPECT_TRUE(m.contains("mine.txt"));
+    ASSERT_TRUE(m.contains("linked/a.txt"));
+    EXPECT_EQ(m.find("linked/a.txt")->hash, sha256("outside a"));
+    EXPECT_TRUE(m.contains("linked/deep/b.txt"));
+    EXPECT_EQ(stats.symlinks_followed, 1u);
+}
+
+TEST(Scanner, FollowedSymlinkLoopStillTerminates) {
+    test::TempDir dir;
+    test::write_file(dir.sub("sub/a.txt"), "a");
+    // The link the walk must refuse: it points at a directory it is already
+    // inside, so following it yields loop/sub, loop/loop/sub, ... forever.
+    if (!make_symlink(dir.path(), dir.sub("loop"), /*directory=*/true))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    Scanner sc({}, /*follow_symlinks=*/true);
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    EXPECT_EQ(m.size(), 1u);
+    EXPECT_TRUE(m.contains("sub/a.txt"));
+    EXPECT_EQ(stats.symlinks_skipped, 1u);
+    EXPECT_EQ(stats.symlinks_followed, 0u);
+}
+
+TEST(Scanner, TwoDirectoriesLinkingToEachOtherStillTerminate) {
+    // Neither link points at its own ancestor, so nothing local looks like a
+    // cycle — only the chain of directories walked through reveals one.
+    test::TempDir dir;
+    test::write_file(dir.sub("a/file.txt"), "in a");
+    test::write_file(dir.sub("b/file.txt"), "in b");
+    if (!make_symlink(dir.path() / "b", dir.sub("a/to-b"), /*directory=*/true) ||
+        !make_symlink(dir.path() / "a", dir.sub("b/to-a"), /*directory=*/true))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    Scanner sc({}, /*follow_symlinks=*/true);
+    Manifest m = sc.scan(dir.str(), nullptr, nullptr);
+
+    // One level of each link is walked; the step that would close the cycle is
+    // refused. The walk finishing at all is the assertion that matters.
+    EXPECT_TRUE(m.contains("a/file.txt"));
+    EXPECT_TRUE(m.contains("b/file.txt"));
+    EXPECT_TRUE(m.contains("a/to-b/file.txt"));
+    EXPECT_TRUE(m.contains("b/to-a/file.txt"));
+    EXPECT_FALSE(m.contains("a/to-b/to-a/file.txt"));
+    EXPECT_EQ(m.size(), 4u);
+}
+
+TEST(Scanner, TwoLinksToOneDirectoryAreNotACycle) {
+    test::TempDir dir, outside;
+    test::write_file(outside.sub("shared.txt"), "shared");
+    if (!make_symlink(outside.path(), dir.sub("one"), /*directory=*/true) ||
+        !make_symlink(outside.path(), dir.sub("two"), /*directory=*/true))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    Scanner sc({}, /*follow_symlinks=*/true);
+    Manifest m = sc.scan(dir.str(), nullptr, nullptr);
+
+    // The directory really is in two places, and a peer rebuilding the structure
+    // has to be told about both.
+    EXPECT_TRUE(m.contains("one/shared.txt"));
+    EXPECT_TRUE(m.contains("two/shared.txt"));
+}
+
+TEST(Scanner, BrokenSymlinkIsSkippedNotSyncedAsEmpty) {
+    test::TempDir dir;
+    test::write_file(dir.sub("keep.txt"), "keep");
+    if (!make_symlink("nothing-here.txt", dir.sub("dangling.txt"), /*directory=*/false))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    Scanner sc({}, /*follow_symlinks=*/true);
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    // A dangling link has no content to send; syncing it as a zero-byte file
+    // would create one on the peer that never existed anywhere.
+    EXPECT_EQ(m.size(), 1u);
+    EXPECT_TRUE(m.contains("keep.txt"));
+    EXPECT_FALSE(m.contains("dangling.txt"));
+    EXPECT_EQ(stats.symlinks_skipped, 1u);
+    EXPECT_EQ(stats.symlinks_followed, 0u);
+}
+
+TEST(Scanner, IgnoreStillWinsOverFollowing) {
+    test::TempDir dir, outside;
+    test::write_file(outside.sub("big.bin"), "not wanted");
+    test::write_file(dir.sub("keep.txt"), "keep");
+    if (!make_symlink(outside.path(), dir.sub("cache"), /*directory=*/true))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    IgnoreList ig;
+    ig.add("cache/");
+    Scanner sc(ig, /*follow_symlinks=*/true);
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    EXPECT_EQ(m.size(), 1u);
+    EXPECT_TRUE(m.contains("keep.txt"));
+    EXPECT_EQ(stats.symlinks_followed, 0u);  // excluded before it is even probed
 }
 
 TEST(Scanner, IgnoredSymlinkIsNotCountedTwice) {

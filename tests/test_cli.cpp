@@ -82,6 +82,22 @@ TEST(Cli, ALaterDirectoryDoesNotInheritAnEarlierDirectorysOverrides) {
     EXPECT_FALSE(o.folders[1].no_delete) << "an override leaked into the next folder";
 }
 
+TEST(Cli, FollowSymlinksIsOffUntilAskedForAndScopesLikeAnyFolderOption) {
+    const Options plain = ok(parse({"./a"}));
+    EXPECT_FALSE(plain.folders[0].follow_symlinks) << "following links must be opt-in";
+
+    // One tree published through links, another left alone: the flag has to be
+    // per folder, like every other thing that describes one directory.
+    const Options o = ok(parse({"./a", "--follow-symlinks", "./b"}));
+    ASSERT_EQ(o.folders.size(), 2u);
+    EXPECT_TRUE(o.folders[0].follow_symlinks);
+    EXPECT_FALSE(o.folders[1].follow_symlinks);
+
+    const Options both = ok(parse({"--follow-symlinks", "./a", "./b"}));
+    EXPECT_TRUE(both.folders[0].follow_symlinks);
+    EXPECT_TRUE(both.folders[1].follow_symlinks) << "the shared default was lost";
+}
+
 TEST(Cli, IgnorePatternsAccumulateDefaultsThenPerFolder) {
     const Options o = ok(parse({"--ignore", "*.tmp", "./a", "--ignore", "*.log", "./b"}));
     ASSERT_EQ(o.folders.size(), 2u);

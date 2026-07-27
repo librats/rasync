@@ -279,7 +279,7 @@ int run_daemon(const Options& opt) {
                                    : fo.ignore_file;
         ignore.add_file(ignore_file);
         for (const auto& p : fo.ignores) ignore.add(p);
-        f.scanner = Scanner(std::move(ignore));
+        f.scanner = Scanner(std::move(ignore), fo.follow_symlinks);
 
         SyncConfig cfg;
         cfg.root = f.root;
@@ -290,6 +290,9 @@ int run_daemon(const Options& opt) {
         cfg.source = fo.source;
         cfg.propagate_deletes = !fo.no_delete;
         cfg.use_delta = !fo.no_delta;
+        // Both halves of the same flag: what the scanner reads through a link, a
+        // transfer must write back through it.
+        cfg.follow_symlinks = fo.follow_symlinks;
         for (const auto& hex : opt.allow) {
             auto id = librats::PeerId::from_hex(hex);
             if (!id) return fail("bad --allow peer id: " + hex);
@@ -362,9 +365,17 @@ int run_daemon(const Options& opt) {
         f->current = f->scanner.scan(f->root, nullptr, &stats);
         f->svc->set_local_manifest(f->current);
         auto scan_ms = duration_cast<milliseconds>(steady_clock::now() - scan_t0).count();
+        // Links are the one thing a scan silently drops from a tree the user can
+        // see, so say so: "why is that file not syncing?" should be answerable
+        // from the first screen, whether or not --follow-symlinks is on.
+        std::string links;
+        if (stats.symlinks_followed)
+            links += ", " + std::to_string(stats.symlinks_followed) + " symlink(s) followed";
+        if (stats.symlinks_skipped)
+            links += ", " + std::to_string(stats.symlinks_skipped) + " symlink(s) skipped";
         line(term::green("indexed ") + std::to_string(f->current.size()) + " files (" +
              term::bytes(f->current.total_bytes()) + ") in " + std::to_string(scan_ms) + "ms" +
-             (multi ? term::gray("  " + f->name) : std::string()));
+             term::gray(links) + (multi ? term::gray("  " + f->name) : std::string()));
     }
 
     if (!node.start()) return fail("failed to start network (port in use?)");
@@ -390,6 +401,7 @@ int run_daemon(const Options& opt) {
                               : term::dim("  conflict ") + conflict_policy_name(fo.conflict))
                       << (fo.no_delta ? term::dim("  no-delta") : "")
                       << (fo.no_delete ? term::dim("  no-delete") : "")
+                      << (fo.follow_symlinks ? term::dim("  follow-symlinks") : "")
                       << "\n";
         }
         // Worth printing: state is deliberately not next to the data, and the

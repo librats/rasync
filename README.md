@@ -344,6 +344,7 @@ to all of them):
 | `--conflict <policy>` | `newer` (default), `larger`, `local`, or `remote`. Peers must pair: `newer`/`newer`, `larger`/`larger`, `local`/`remote`. |
 | `--no-delete` | Never delete files — additive sync only. |
 | `--no-delta` | Send whole files instead of rsync deltas. |
+| `--follow-symlinks` | Sync what a symbolic link points at as if it were a real file or directory. See [Symbolic links](#symbolic-links). |
 | `--ignore <pattern>` | Exclude paths (gitignore syntax). Repeatable. |
 | `--ignore-file <path>` | Load ignore patterns from a file. |
 
@@ -410,6 +411,43 @@ node_modules/
 !keep.log
 ```
 
+### Symbolic links
+
+**By default a symbolic link is skipped, never followed.** A manifest describes
+files, not links, so following one would either copy data from outside the synced
+tree to the peer without saying so, or — for a link pointing back into the tree —
+walk in circles forever. Each scan reports how many it passed over, so a file that
+is not syncing is not a mystery.
+
+`--follow-symlinks` makes rasync read a link as **the thing it points at**: a link
+to a file is scanned as that file, a link to a directory is descended into, and the
+peer receives ordinary files and directories. That is what lets a Linux tree built
+out of links arrive on a Windows machine — which has no links of its own — as the
+same structure in plain form. It is a per-folder, purely local decision: nothing
+about it is negotiated, and the peer needs no matching flag.
+
+What follows from treating a link as the real thing:
+
+- **Content from outside the tree is synced.** That is the point of the flag, and
+  the reason it is not the default: `--follow-symlinks` on a tree with a link to
+  `/etc` sends `/etc` to the peer. Combine it with `--ignore` for links you do not
+  want followed — an excluded path is never even probed.
+- **An update coming back is written to the link's target,** not over the link. The
+  link stays a link and the data it points at is what changes — which is already
+  how a file *inside* a linked directory behaves, since the OS resolves that path
+  for us. Overwriting the link with a copy instead would silently detach the tree
+  from the data it was deliberately pointed at.
+- **A delete removes the link, not its target.** The path disappears here and both
+  trees agree, but data outside the synced directory is never deleted on a peer's
+  say-so. (A file *inside* a linked directory is a normal file at a resolved path,
+  and is deleted like any other.)
+- **Loops terminate.** Following turns the tree into a graph, and rasync refuses to
+  descend into a directory that is already on the chain it walked through — the
+  rule `find -L` uses. Two separate links to one directory are not a loop and are
+  both walked, so the peer sees the structure that is really there (and the content
+  twice).
+- **A broken link is skipped and counted,** never synced as an empty file.
+
 ---
 
 ## Notes & limitations
@@ -446,9 +484,10 @@ node_modules/
 - **Large single files & delta.** Delta reconstruction reads the sender's file into
   memory to run the scan; files above `256 MiB` fall back to whole-file streaming
   (always bounded memory). Everything else streams in fixed windows.
-- **Regular files only.** A symlink is skipped, never followed — rasync cannot
-  represent one in a manifest, and following it would either copy data from outside
-  the synced tree or walk in circles. Empty directories are not tracked either; the
+- **Regular files only.** A symlink is skipped unless `--follow-symlinks` is given,
+  in which case it is synced as the file or directory it points at — a link itself
+  is never reproduced on the peer, because a manifest cannot represent one. See
+  [Symbolic links](#symbolic-links). Empty directories are not tracked either; the
   only ones rasync removes are those its own deletions emptied.
 - Both peers should run with the **same mode** (`two-way` vs `mirror`); rasync warns
   on a mismatch but does not enforce it. Conflict policies, by contrast, **are**

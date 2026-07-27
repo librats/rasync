@@ -77,6 +77,9 @@ std::string help_text(const std::string& prog) {
     o << "                             local/remote — a mismatch is refused)\n";
     o << "  " << green("    --no-delete") << "          never delete files (additive sync)\n";
     o << "  " << green("    --no-delta") << "           send whole files instead of rsync deltas\n";
+    o << "  " << green("    --follow-symlinks") << "    sync what a symlink points at as a real file\n";
+    o << "                            or directory (default: links are skipped; an\n";
+    o << "                            update to one is written to its target)\n";
     o << "  " << green("    --ignore") << " <pattern>   exclude paths (gitignore syntax, repeatable)\n";
     o << "  " << green("    --ignore-file") << " <path> load ignore patterns from a file\n";
     o << "                            (default: <directory>/.rasyncignore)\n\n";
@@ -190,6 +193,7 @@ ParseResult parse_args(int argc, char** argv) {
         }
         else if (arg == "--no-delete")             current().no_delete = true;
         else if (arg == "--no-delta")              current().no_delta = true;
+        else if (arg == "--follow-symlinks")       current().follow_symlinks = true;
         else if (arg == "--ignore")                current().ignores.push_back(next(arg));
         else if (arg == "--ignore-file")           current().ignore_file = next(arg);
         else if (arg == "--interval") {

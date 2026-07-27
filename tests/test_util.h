@@ -57,6 +57,18 @@ inline std::string read_file(const std::string& path) {
                        std::istreambuf_iterator<char>());
 }
 
+/// Create a symbolic link, reporting whether this host allows one at all.
+/// Creating a symlink needs Developer Mode or admin rights on Windows, so a test
+/// that needs one has to skip on a host without them — but it must never pass by
+/// silently not creating the link, hence the explicit check that one now exists.
+inline bool make_symlink(const fs::path& target, const std::string& link, bool directory) {
+    std::error_code ec;
+    if (directory) fs::create_directory_symlink(target, link, ec);
+    else           fs::create_symlink(target, link, ec);
+    if (ec) return false;
+    return fs::is_symlink(fs::symlink_status(link, ec));
+}
+
 inline std::vector<uint8_t> random_bytes(size_t n, uint32_t seed = 1) {
     // Deterministic LCG — reproducible test inputs without <random> overhead.
     std::vector<uint8_t> out(n);

@@ -32,8 +32,8 @@ IgnoreList make_ignore() {
     return ig;
 }
 
-Manifest disk_state(const std::string& root) {
-    return Scanner(make_ignore()).scan(root);
+Manifest disk_state(const std::string& root, bool follow_symlinks = false) {
+    return Scanner(make_ignore(), follow_symlinks).scan(root);
 }
 
 template <typename Pred>
@@ -62,8 +62,9 @@ struct Folder {
     SyncService*  svc = nullptr;   ///< owned by the endpoint's router
     std::atomic<int> synced_events{0};
 
-    explicit Folder(std::string folder_name)
-        : name(std::move(folder_name)), root(dir.str()), scanner(make_ignore()) {}
+    explicit Folder(std::string folder_name, bool follow_symlinks = false)
+        : name(std::move(folder_name)), root(dir.str()),
+          scanner(make_ignore(), follow_symlinks) {}
 
     void publish() {
         current = scanner.scan(root, &current, nullptr);
@@ -90,10 +91,12 @@ struct Endpoint {
                       size_t max_update_bytes = 0,
                       ConflictPolicy conflict = ConflictPolicy::Newer,
                       const std::string& key = {},
-                      const std::vector<librats::PeerId>& allow = {}) {
+                      const std::vector<librats::PeerId>& allow = {},
+                      bool follow_symlinks = false) {
         cfg.mode = mode;
         cfg.source = source;
         cfg.conflict = conflict;
+        cfg.follow_symlinks = follow_symlinks;
         cfg.allowed_peers.insert(allow.begin(), allow.end());
         if (max_update_bytes) cfg.max_update_bytes = max_update_bytes;
 
@@ -122,7 +125,9 @@ struct Endpoint {
 
     /// Add a folder. Before start(), like a real run's command line.
     Folder& add_folder(const std::string& name) {
-        auto f = std::make_unique<Folder>(name);
+        // The scanner reads through links exactly when the service writes back
+        // through them: one flag, both halves (SyncConfig::follow_symlinks).
+        auto f = std::make_unique<Folder>(name, cfg.follow_symlinks);
         SyncConfig c = cfg;
         c.root = f->root;
         c.data_dir = f->state.str();
@@ -369,6 +374,97 @@ TEST(SyncIntegration, LargeDeltaWithCopiesDrainsTheSendWindow) {
     std::string got = test::read_file(b.first().sub(rel));
     ASSERT_EQ(got.size(), modified.size());
     EXPECT_EQ(0, std::memcmp(got.data(), modified.data(), modified.size()));
+}
+
+// ── --follow-symlinks, end to end ────────────────────────────────────────────
+//
+// The point of the option is a peer that has no links of its own — a Windows host
+// receiving a Linux tree published through them. So what these check is that the
+// *content* crosses as ordinary files, and that an update coming back lands on the
+// data the link points at instead of overwriting the link with a copy.
+
+TEST(SyncIntegration, FollowedLinksReachThePeerAsOrdinaryFilesAndDirectories) {
+    test::TempDir outside;  // the real data, deliberately not inside the tree
+    test::write_file(outside.sub("data.txt"), "linked file content");
+    test::write_file(outside.sub("sub/deep.txt"), "linked directory content");
+
+    Endpoint a(SyncMode::TwoWay, /*source=*/false, /*max_update_bytes=*/0,
+               ConflictPolicy::Newer, /*key=*/{}, /*allow=*/{}, /*follow_symlinks=*/true);
+    Endpoint b;  // the other machine follows nothing — it has no links to follow
+    test::write_file(a.first().sub("plain.txt"), "an ordinary file");
+    if (!test::make_symlink(outside.path() / "data.txt", a.first().sub("link.txt"),
+                            /*directory=*/false) ||
+        !test::make_symlink(outside.path(), a.first().sub("linked-dir"),
+                            /*directory=*/true))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        Manifest db = disk_state(b.first().root);
+        return db.contains("link.txt") && db.contains("linked-dir/sub/deep.txt");
+    })) << "the linked content never reached the peer";
+
+    EXPECT_EQ(test::read_file(b.first().sub("link.txt")), "linked file content");
+    EXPECT_EQ(test::read_file(b.first().sub("linked-dir/data.txt")), "linked file content");
+    EXPECT_EQ(test::read_file(b.first().sub("linked-dir/sub/deep.txt")),
+              "linked directory content");
+    // Real files and a real directory on the receiving side: nothing about the
+    // link survives the wire, which is what makes this work on a host without them.
+    std::error_code ec;
+    EXPECT_FALSE(std::filesystem::is_symlink(
+        std::filesystem::symlink_status(b.first().sub("link.txt"), ec)));
+    EXPECT_FALSE(std::filesystem::is_symlink(
+        std::filesystem::symlink_status(b.first().sub("linked-dir"), ec)));
+
+    // A follows links, B does not — and the two trees still agree, each read the
+    // way its own side reads it. Nothing about following is negotiated.
+    EXPECT_EQ(disk_state(a.first().root, /*follow_symlinks=*/true).fingerprint(),
+              disk_state(b.first().root).fingerprint());
+}
+
+TEST(SyncIntegration, AnUpdateToAFollowedLinkIsWrittenThroughToItsTarget) {
+    test::TempDir outside;
+    test::write_file(outside.sub("data.txt"), "first version");
+
+    Endpoint a(SyncMode::TwoWay, /*source=*/false, /*max_update_bytes=*/0,
+               ConflictPolicy::Newer, /*key=*/{}, /*allow=*/{}, /*follow_symlinks=*/true);
+    Endpoint b;
+    if (!test::make_symlink(outside.path() / "data.txt", a.first().sub("link.txt"),
+                            /*directory=*/false))
+        GTEST_SKIP() << "symlinks unavailable on this host";
+
+    a.start();
+    b.start();
+    connect(b, a);
+
+    ASSERT_TRUE(wait_until([&] {
+        return test::read_file(b.first().sub("link.txt")) == "first version";
+    })) << "the linked file never reached the peer";
+
+    // B edits its ordinary copy and wins the round (mtime resolution is one
+    // second, so the new version is pushed clear of a tie rather than raced).
+    test::write_file(b.first().sub("link.txt"), "second version, edited on the peer");
+    std::error_code ec;
+    std::filesystem::last_write_time(
+        b.first().sub("link.txt"),
+        std::filesystem::last_write_time(b.first().sub("link.txt"), ec) + seconds(10), ec);
+    b.publish();
+
+    // The bytes belong to the file the link points at — which is outside the
+    // synced tree, exactly where the user put it.
+    ASSERT_TRUE(wait_until([&] {
+        return test::read_file(outside.sub("data.txt")) == "second version, edited on the peer";
+    })) << "the update never reached the link's target";
+
+    // And the link is still a link: replacing it with a copy would leave the tree
+    // holding data that no longer tracks what it was pointed at.
+    EXPECT_TRUE(std::filesystem::is_symlink(
+        std::filesystem::symlink_status(a.first().sub("link.txt"), ec)));
+    EXPECT_EQ(test::read_file(a.first().sub("link.txt")),
+              "second version, edited on the peer");
 }
 
 TEST(SyncIntegration, DeletionPropagates) {

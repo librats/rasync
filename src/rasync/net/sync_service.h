@@ -68,6 +68,17 @@ struct SyncConfig {
     bool           source            = false;   ///< mirror mode: this side is authoritative
     bool           propagate_deletes = true;
 
+    /// Treat a symbolic link as the file or directory it points at, both when
+    /// scanning (see core/scanner.h) and when a transfer lands on one: the bytes
+    /// then replace the *target*, exactly as they already do for a file inside a
+    /// linked directory, where the OS resolves the path for us. Renaming over the
+    /// link instead would quietly turn it into a copy and detach the tree from the
+    /// data it was deliberately pointed at.
+    ///
+    /// Purely local: nothing about it is negotiated, because a manifest describes
+    /// files either way. One peer may follow links while the other has none.
+    bool           follow_symlinks   = false;
+
     /// If non-empty, the only peers we will sync with. Anyone else still
     /// completes the librats handshake (they hold the shared key, or there is no
     /// key) but is then ignored outright: no session, so we never describe our
