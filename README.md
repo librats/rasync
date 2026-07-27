@@ -1,5 +1,12 @@
 # rasync
 
+<p align="center"><a href="https://github.com/librats/rasync"><img src="https://raw.githubusercontent.com/librats/rasync/master/docs/logo.png"></a></p>
+
+[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![Release](https://img.shields.io/github/release/librats/rasync.svg)](https://github.com/librats/rasync/releases)
+
 **Real-time, two-way directory synchronization over a peer-to-peer network.**
 
 `rasync` keeps two directories on different machines identical — continuously and
