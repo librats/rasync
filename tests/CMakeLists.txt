@@ -21,6 +21,7 @@ include(GoogleTest)
 add_executable(rasync_core_tests
     test_serialize.cpp
     test_hash.cpp
+    test_file_stat.cpp
     test_manifest.cpp
     test_ignore.cpp
     test_path.cpp

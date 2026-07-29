@@ -3,6 +3,7 @@
 #include "net/sync_service.h"
 
 #include "core/diff.h"
+#include "core/file_stat.h"
 #include "core/hash.h"
 #include "core/path.h"
 
@@ -507,12 +508,12 @@ void SyncSession::send_request(const std::string& rel_path) {
     w.str16(rel_path);
 
     // A signature lets the peer answer with a delta. It is only worth building if
-    // we actually hold a copy — the file size doubles as the existence check.
+    // we actually hold a copy — the lookup doubles as the existence check.
     bool sent_sig = false;
     if (cfg.use_delta) {
         std::string abs = service_.abs_path(rel_path);
-        int64_t have = librats::get_file_size(abs.c_str());
-        if (have >= 0 && static_cast<uint64_t>(have) <= cfg.delta_max_bytes) {
+        const FileStat have = stat_follow(abs);
+        if (have.exists && !have.directory && have.size <= cfg.delta_max_bytes) {
             if (auto sig = signature_of_file(abs, cfg.block_size)) {
                 w.u8(1);
                 sig->encode(w);
@@ -637,16 +638,18 @@ void SyncSession::sender_loop() {
 
 void SyncSession::serve_one(const Serve& job) {
     std::string abs = service_.abs_path(job.rel_path);
-    if (!librats::file_exists(abs)) {
+    // One lookup for existence, size and mtime — and one that resolves a link, so
+    // a followed link is served as the bytes it points at rather than as the
+    // empty reparse point its own entry describes.
+    const FileStat st = stat_follow(abs);
+    if (!st.exists || st.directory) {
         auto w = msg(proto::Op::NotFound);
         w.str16(job.rel_path);
         send_msg(w);
         return;
     }
-    int64_t fsize = librats::get_file_size(abs.c_str());
-    if (fsize < 0) fsize = 0;
-    uint64_t size = static_cast<uint64_t>(fsize);
-    int64_t mtime = static_cast<int64_t>(librats::get_file_modified_time(abs));
+    uint64_t size = st.size;
+    int64_t mtime = st.mtime;
     uint32_t mode = 0;
     // Bind the manifest to a named object: local_manifest() hands back a copy, and
     // find() points inside it — a pointer into the temporary would dangle before

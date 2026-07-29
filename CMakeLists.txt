@@ -82,6 +82,7 @@ add_subdirectory(src/librats)
 # ── rasync_core: pure, network-free sync logic (the unit-tested heart) ───────
 add_library(rasync_core STATIC
     src/rasync/core/hash.cpp
+    src/rasync/core/file_stat.cpp
     src/rasync/core/manifest.cpp
     src/rasync/core/ignore.cpp
     src/rasync/core/scanner.cpp

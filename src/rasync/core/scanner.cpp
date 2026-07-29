@@ -1,5 +1,6 @@
 #include "core/scanner.h"
 
+#include "core/file_stat.h"
 #include "util/fs.h"
 
 #include <algorithm>
@@ -19,10 +20,10 @@ namespace {
 namespace fs = std::filesystem;
 
 /// What one directory entry is, beyond what `list_directory` reports. The first
-/// look is always a *no-follow* one: `list_directory` uses `stat`, which reports a
-/// symlink as whatever it points at, and the executable bit has to be read off the
-/// file's own mode anyway. When links are being followed the target is looked at
-/// too, because that is what the entry then stands for — and on Windows a link's
+/// look is always a *no-follow* one: `list_directory` reports a symlink as
+/// whatever the platform feels like reporting, and the executable bit has to be
+/// read off the file's own mode anyway. When links are being followed the target
+/// is looked at too, because that is what the entry then stands for — a link's
 /// own directory entry carries neither the target's size nor its mtime.
 struct EntryProbe {
     bool     symlink   = false;
@@ -39,37 +40,35 @@ EntryProbe probe_entry(const std::string& abs_path, bool follow) {
     struct stat st{};
     if (::lstat(abs_path.c_str(), &st) != 0) return p;
     p.symlink = S_ISLNK(st.st_mode);
-    if (p.symlink) {
-        if (!follow) return p;
-        // Same path, this time resolving the link: a dangling one fails here and
-        // is the caller's cue to skip rather than sync a file that isn't there.
-        struct stat target{};
-        if (::stat(abs_path.c_str(), &target) != 0) { p.broken = true; return p; }
-        st = target;
+    if (!p.symlink) {
+        p.directory = S_ISDIR(st.st_mode);
+        // Owner-executable bit, POSIX only (Windows has no such concept for files).
+        if (!p.directory && (st.st_mode & S_IXUSR)) p.mode = FileMeta::kExecutable;
+        return p;
     }
-    p.directory = S_ISDIR(st.st_mode);
-    p.size      = static_cast<uint64_t>(st.st_size);
-    p.mtime     = static_cast<int64_t>(st.st_mtime);
-    // Owner-executable bit, POSIX only (Windows has no such concept for files).
-    // Read off whatever the entry stands for, so a followed link carries the
-    // permission of the file it points at.
-    if (!p.directory && (st.st_mode & S_IXUSR)) p.mode = FileMeta::kExecutable;
 #else
     // No executable bit worth carrying on Windows, but it does have symlinks and
     // directory junctions — both reparse points, both reported as a symlink here,
     // and a junction loops the walk just as effectively as a symlink would.
     std::error_code ec;
     p.symlink = fs::is_symlink(fs::symlink_status(abs_path, ec));
-    if (!p.symlink || !follow) return p;
-    const fs::file_status target = fs::status(abs_path, ec);  // follows
-    if (ec || !fs::exists(target)) { p.broken = true; return p; }
-    p.directory = fs::is_directory(target);
-    if (!p.directory) {
-        const int64_t size = librats::get_file_size(abs_path.c_str());
-        p.size  = size < 0 ? 0 : static_cast<uint64_t>(size);
-        p.mtime = static_cast<int64_t>(librats::get_file_modified_time(abs_path.c_str()));
-    }
+    if (!p.symlink) return p;
 #endif
+    if (!follow) return p;
+
+    // Same path, this time resolved: a followed link *is* its target, and its own
+    // directory entry describes neither the target's size nor its mtime — on
+    // Windows it is a zero-length reparse point, which would advertise an empty
+    // file to the peer. A dangling link has nothing behind it and comes back
+    // `!exists`, which is the caller's cue to skip rather than sync a file that
+    // isn't there. `stat_follow` rather than `stat()` because the CRTs disagree
+    // about whether the latter follows a reparse point at all (see file_stat.h).
+    const FileStat target = stat_follow(abs_path);
+    if (!target.exists) { p.broken = true; return p; }
+    p.directory = target.directory;
+    p.size      = target.size;
+    p.mtime     = target.mtime;
+    p.mode      = target.mode;  // the permission of the file pointed at
     return p;
 }
 
