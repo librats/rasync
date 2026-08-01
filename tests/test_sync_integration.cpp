@@ -402,9 +402,14 @@ TEST(SyncIntegration, FollowedLinksReachThePeerAsOrdinaryFilesAndDirectories) {
     b.start();
     connect(b, a);
 
+    // Wait for the whole round, not just for the linked entries: plain.txt sorts
+    // last of the four, so "the links arrived" is true one file before the tree is
+    // complete — and the fingerprint below would then compare 3 entries against 4.
     ASSERT_TRUE(wait_until([&] {
         Manifest db = disk_state(b.first().root);
-        return db.contains("link.txt") && db.contains("linked-dir/sub/deep.txt");
+        return db.contains("link.txt") && db.contains("linked-dir/sub/deep.txt") &&
+               disk_state(a.first().root, /*follow_symlinks=*/true).fingerprint() ==
+                   db.fingerprint();
     })) << "the linked content never reached the peer";
 
     EXPECT_EQ(test::read_file(b.first().sub("link.txt")), "linked file content");
