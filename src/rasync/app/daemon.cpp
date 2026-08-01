@@ -367,12 +367,15 @@ int run_daemon(const Options& opt) {
         auto scan_ms = duration_cast<milliseconds>(steady_clock::now() - scan_t0).count();
         // Links are the one thing a scan silently drops from a tree the user can
         // see, so say so: "why is that file not syncing?" should be answerable
-        // from the first screen, whether or not --follow-symlinks is on.
+        // from the first screen, whether or not --follow-symlinks is on. "link"
+        // rather than "symlink" because a Windows junction is counted here too,
+        // and being told a symlink was skipped in a tree holding none is its own
+        // small mystery.
         std::string links;
         if (stats.symlinks_followed)
-            links += ", " + std::to_string(stats.symlinks_followed) + " symlink(s) followed";
+            links += ", " + std::to_string(stats.symlinks_followed) + " link(s) followed";
         if (stats.symlinks_skipped)
-            links += ", " + std::to_string(stats.symlinks_skipped) + " symlink(s) skipped";
+            links += ", " + std::to_string(stats.symlinks_skipped) + " link(s) skipped";
         line(term::green("indexed ") + std::to_string(f->current.size()) + " files (" +
              term::bytes(f->current.total_bytes()) + ") in " + std::to_string(scan_ms) + "ms" +
              term::gray(links) + (multi ? term::gray("  " + f->name) : std::string()));

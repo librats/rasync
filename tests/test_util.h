@@ -4,6 +4,7 @@
 // for writing/reading files, so filesystem-touching tests stay terse.
 
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -68,6 +69,50 @@ inline bool make_symlink(const fs::path& target, const std::string& link, bool d
     if (ec) return false;
     return fs::is_symlink(fs::symlink_status(link, ec));
 }
+
+/// A directory junction, held for the lifetime of the object — Windows' other
+/// name-surrogate reparse point, and the one that matters most in practice: it
+/// needs neither privilege nor Developer Mode, so unlike a symlink it is always
+/// creatable, and Windows ships several in every user profile pointing at their
+/// own parent. There is no portable API to make one, hence the shell-out; there
+/// is no portable API to *see* one either, which is what the tests assert.
+///
+/// It removes itself, and that is not tidiness. `std::filesystem::remove_all` on
+/// libstdc++ cannot tell a junction from a directory, so a junction left for
+/// TempDir to clean up is deleted *through* — taking the target's contents with
+/// it, and never terminating at all when the junction points at its own parent.
+/// Declare one after the TempDir it lives in and the destruction order is right.
+class Junction {
+public:
+    Junction(const fs::path& target, const std::string& link) {
+#ifdef _WIN32
+        const std::string cmd =
+            "cmd /c mklink /J \"" + link + "\" \"" + target.string() + "\" >nul 2>&1";
+        if (std::system(cmd.c_str()) != 0) return;
+        std::error_code ec;
+        if (!fs::is_directory(link, ec)) return;
+        path_ = link;
+#else
+        (void)target;
+        (void)link;  // no junctions here; the test skips
+#endif
+    }
+    ~Junction() {
+        if (path_.empty()) return;
+        std::error_code ec;
+        // `remove`, never `remove_all`: this must unlink the junction itself and
+        // leave whatever it points at alone.
+        fs::remove(path_, ec);
+    }
+    Junction(const Junction&) = delete;
+    Junction& operator=(const Junction&) = delete;
+
+    /// False where this host has no junctions — the test's cue to skip.
+    bool ok() const { return !path_.empty(); }
+
+private:
+    std::string path_;
+};
 
 inline std::vector<uint8_t> random_bytes(size_t n, uint32_t seed = 1) {
     // Deterministic LCG — reproducible test inputs without <random> overhead.

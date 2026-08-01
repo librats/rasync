@@ -105,8 +105,9 @@ void prune_empty_dirs(const std::string& root, const std::string& rel_path) {
         // without looking inside it, so the "a non-empty directory is refused"
         // guarantee this walk rests on does not hold for one. Stop at it and the
         // tree the user linked to keeps both its contents and its name here.
-        if (fs::is_symlink(fs::symlink_status(root_path / dir, ec))) return;
-        ec.clear();
+        // Asked through `stat_nofollow`, because a junction is just as removable
+        // and `std::filesystem` does not call one a link on any toolchain.
+        if (stat_nofollow((root_path / dir).string()).link) return;
         if (!fs::remove(root_path / dir, ec) || ec) return;  // not empty, or gone
     }
 }
@@ -117,13 +118,18 @@ void prune_empty_dirs(const std::string& root, const std::string& rel_path) {
 // Renaming over the link instead would replace it with a copy and silently detach
 // the tree from the data it was pointed at. Non-links, and a run that does not
 // follow links, come back unchanged.
+// Both questions go to the platform rather than to std::filesystem, for the same
+// reason the scanner's do: `is_symlink` is false for a junction on MSVC and for
+// everything on libstdc++, and `weakly_canonical` hands a reparse point straight
+// back — so on those builds the rename would land on the link after all, which is
+// the one outcome this function exists to prevent (see core/file_stat.h).
 std::string resolve_link(const std::string& path, bool follow) {
     if (!follow) return path;
-    std::error_code ec;
-    if (!fs::is_symlink(fs::symlink_status(path, ec))) return path;
-    fs::path real = fs::weakly_canonical(path, ec);
-    if (ec || real.empty()) return path;  // unresolvable: leave it where it was
-    return real.string();
+    if (!stat_nofollow(path).link) return path;
+    const std::string real = real_path(path);
+    // Nothing behind it: a dangling link resolves to nowhere, and the bytes land
+    // on the link's own path — which is where `weakly_canonical` left them too.
+    return real.empty() ? path : real;
 }
 
 // Move `from` onto `to`, replacing an existing `to`, creating parent dirs.

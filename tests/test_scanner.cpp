@@ -7,6 +7,7 @@
 
 using namespace rasync;
 
+using rasync::test::Junction;
 using rasync::test::make_symlink;
 
 TEST(Scanner, WalksTreeAndHashes) {
@@ -298,4 +299,89 @@ TEST(Scanner, IgnoredSymlinkIsNotCountedTwice) {
     // Excluded by pattern, so it never reaches the symlink probe at all.
     EXPECT_EQ(m.size(), 1u);
     EXPECT_EQ(stats.symlinks_skipped, 0u);
+}
+
+// ── Junctions ────────────────────────────────────────────────────────────────
+//
+// The Windows link nothing in the standard library calls a link, and the one a
+// user has without asking for it: `mklink /J` needs no privilege, and Windows
+// puts several in every profile — `AppData\Local\Application Data` points at
+// `AppData\Local`, its own parent. A walk that reads one as an ordinary
+// directory descends `junc/junc/junc/…` until it runs out of memory, so these
+// tests hang rather than fail if the classification regresses.
+
+TEST(Scanner, JunctionIsSkippedLikeASymlink) {
+    test::TempDir dir, outside;
+    test::write_file(outside.sub("theirs.txt"), "not ours to sync");
+    test::write_file(dir.sub("mine.txt"), "ours");
+    Junction junc(outside.path(), dir.sub("junc"));
+    if (!junc.ok()) GTEST_SKIP() << "junctions unavailable on this host";
+
+    Scanner sc;
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    // Following it would have copied someone else's tree to the peer, which is
+    // exactly what the default refuses for a symlink.
+    EXPECT_EQ(m.size(), 1u);
+    EXPECT_TRUE(m.contains("mine.txt"));
+    EXPECT_FALSE(m.contains("junc/theirs.txt"));
+    EXPECT_EQ(stats.symlinks_skipped, 1u);
+}
+
+TEST(Scanner, SelfReferentialJunctionDoesNotHangTheWalk) {
+    test::TempDir dir;
+    test::write_file(dir.sub("sub/a.txt"), "a");
+    // The shape Windows ships in every user profile: a junction pointing at the
+    // directory that contains it.
+    Junction loop(dir.path(), dir.sub("loop"));
+    if (!loop.ok()) GTEST_SKIP() << "junctions unavailable on this host";
+
+    Scanner sc;
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    EXPECT_EQ(m.size(), 1u);
+    EXPECT_TRUE(m.contains("sub/a.txt"));
+    EXPECT_EQ(stats.symlinks_skipped, 1u);
+}
+
+TEST(Scanner, FollowedJunctionBringsInATreeFromOutside) {
+    test::TempDir dir, outside;
+    test::write_file(outside.sub("a.txt"), "outside a");
+    test::write_file(outside.sub("deep/b.txt"), "outside b");
+    test::write_file(dir.sub("mine.txt"), "ours");
+    Junction linked(outside.path(), dir.sub("linked"));
+    if (!linked.ok()) GTEST_SKIP() << "junctions unavailable on this host";
+
+    Scanner sc({}, /*follow_symlinks=*/true);
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    // Followed, a junction is a plain subdirectory to the peer — the same bargain
+    // `--follow-symlinks` makes everywhere else.
+    EXPECT_EQ(m.size(), 3u);
+    ASSERT_TRUE(m.contains("linked/a.txt"));
+    EXPECT_EQ(m.find("linked/a.txt")->hash, sha256("outside a"));
+    EXPECT_TRUE(m.contains("linked/deep/b.txt"));
+    EXPECT_EQ(stats.symlinks_followed, 1u);
+}
+
+TEST(Scanner, FollowedJunctionLoopStillTerminates) {
+    test::TempDir dir;
+    test::write_file(dir.sub("sub/a.txt"), "a");
+    Junction loop(dir.path(), dir.sub("loop"));
+    if (!loop.ok()) GTEST_SKIP() << "junctions unavailable on this host";
+
+    // Recognising the cycle means resolving the junction to the directory it
+    // points at — which is why the chain is keyed on `real_path` and not on
+    // `weakly_canonical`, whose Windows answer for a junction is the junction.
+    Scanner sc({}, /*follow_symlinks=*/true);
+    ScanStats stats;
+    Manifest m = sc.scan(dir.str(), nullptr, &stats);
+
+    EXPECT_EQ(m.size(), 1u);
+    EXPECT_TRUE(m.contains("sub/a.txt"));
+    EXPECT_EQ(stats.symlinks_skipped, 1u);
+    EXPECT_EQ(stats.symlinks_followed, 0u);
 }

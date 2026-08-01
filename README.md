@@ -419,11 +419,20 @@ tree to the peer without saying so, or — for a link pointing back into the tre
 walk in circles forever. Each scan reports how many it passed over, so a file that
 is not syncing is not a mystery.
 
+**On Windows a directory junction counts as a link too.** It carries a different
+reparse tag and no C++ standard library calls it a link, but it points at a
+directory exactly as a symlink does — including at its own parent, which is the
+shape Windows puts in every user profile (`AppData\Local\Application Data`).
+rasync classifies by the tag the OS itself marks as a name surrogate, so a
+junction is skipped, followed and counted wherever this section says "link".
+Reparse points that are still ordinary files — OneDrive placeholders,
+deduplicated and WIM-backed files — are not links and sync as the files they are.
+
 `--follow-symlinks` makes rasync read a link as **the thing it points at**: a link
 to a file is scanned as that file, a link to a directory is descended into, and the
 peer receives ordinary files and directories. That is what lets a Linux tree built
-out of links arrive on a Windows machine — which has no links of its own — as the
-same structure in plain form. It is a per-folder, purely local decision: nothing
+out of links arrive on a Windows machine — where creating one needs a privilege
+the user may not have — as the same structure in plain form. It is a per-folder, purely local decision: nothing
 about it is negotiated, and the peer needs no matching flag.
 
 What follows from treating a link as the real thing:
@@ -484,9 +493,10 @@ What follows from treating a link as the real thing:
 - **Large single files & delta.** Delta reconstruction reads the sender's file into
   memory to run the scan; files above `256 MiB` fall back to whole-file streaming
   (always bounded memory). Everything else streams in fixed windows.
-- **Regular files only.** A symlink is skipped unless `--follow-symlinks` is given,
-  in which case it is synced as the file or directory it points at — a link itself
-  is never reproduced on the peer, because a manifest cannot represent one. See
+- **Regular files only.** A symlink — and on Windows a directory junction — is
+  skipped unless `--follow-symlinks` is given, in which case it is synced as the
+  file or directory it points at; a link itself is never reproduced on the peer,
+  because a manifest cannot represent one. See
   [Symbolic links](#symbolic-links). Empty directories are not tracked either; the
   only ones rasync removes are those its own deletions emptied.
 - Both peers should run with the **same mode** (`two-way` vs `mirror`); rasync warns

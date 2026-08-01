@@ -14,7 +14,9 @@
  * Regular files only: a symlink is skipped by default, never followed. rasync has
  * no way to represent a link in a manifest, and following one would either copy
  * data from outside the synced tree to the peer or — for a link that points back
- * into the tree — walk in circles forever.
+ * into the tree — walk in circles forever. A Windows *junction* is a link for
+ * every purpose here: a different reparse tag, the same two hazards, and the ones
+ * Windows puts in every user profile point straight at their own parent.
  *
  * `follow_symlinks` opts out of that: a link is then read as the thing it points
  * at, so a link to a file is scanned as a regular file and a link to a directory

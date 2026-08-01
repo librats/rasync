@@ -7,12 +7,7 @@
 #include <cctype>
 #include <filesystem>
 #include <memory>
-#include <system_error>
 #include <vector>
-
-#ifndef _WIN32
-#include <sys/stat.h>
-#endif
 
 namespace rasync {
 namespace {
@@ -20,11 +15,16 @@ namespace {
 namespace fs = std::filesystem;
 
 /// What one directory entry is, beyond what `list_directory` reports. The first
-/// look is always a *no-follow* one: `list_directory` reports a symlink as
-/// whatever the platform feels like reporting, and the executable bit has to be
-/// read off the file's own mode anyway. When links are being followed the target
-/// is looked at too, because that is what the entry then stands for — a link's
-/// own directory entry carries neither the target's size nor its mtime.
+/// look is always a *no-follow* one: an entry has to be recognised as a link
+/// before anything decides whether to walk through it, and the executable bit
+/// has to be read off the entry's own mode anyway. When links are being followed
+/// the target is looked at too, because that is what the entry then stands for —
+/// a link's own directory entry carries neither the target's size nor its mtime.
+///
+/// `symlink` covers a Windows junction as well: it is a different reparse tag but
+/// the same hazard, since it points at a directory and can point at its own
+/// ancestor. `stat_nofollow` is what draws that line — see file_stat.h for why
+/// neither `stat()` nor `std::filesystem` can be asked instead.
 struct EntryProbe {
     bool     symlink   = false;
     bool     broken    = false;  ///< a followed link whose target isn't there
@@ -36,24 +36,14 @@ struct EntryProbe {
 
 EntryProbe probe_entry(const std::string& abs_path, bool follow) {
     EntryProbe p;
-#ifndef _WIN32
-    struct stat st{};
-    if (::lstat(abs_path.c_str(), &st) != 0) return p;
-    p.symlink = S_ISLNK(st.st_mode);
+    const FileStat self = stat_nofollow(abs_path);
+    if (!self.exists) return p;  // gone between the listing and now
+    p.symlink = self.link;
     if (!p.symlink) {
-        p.directory = S_ISDIR(st.st_mode);
-        // Owner-executable bit, POSIX only (Windows has no such concept for files).
-        if (!p.directory && (st.st_mode & S_IXUSR)) p.mode = FileMeta::kExecutable;
+        p.directory = self.directory;
+        p.mode      = self.mode;  // the entry's own permission; always 0 on Windows
         return p;
     }
-#else
-    // No executable bit worth carrying on Windows, but it does have symlinks and
-    // directory junctions — both reparse points, both reported as a symlink here,
-    // and a junction loops the walk just as effectively as a symlink would.
-    std::error_code ec;
-    p.symlink = fs::is_symlink(fs::symlink_status(abs_path, ec));
-    if (!p.symlink) return p;
-#endif
     if (!follow) return p;
 
     // Same path, this time resolved: a followed link *is* its target, and its own
@@ -80,8 +70,7 @@ std::string join_rel(const std::string& base, const std::string& name) {
 /// resolved, folded to lower case where the platform's paths are case-insensitive
 /// — two spellings of one directory have to compare equal, or a cycle spelled
 /// inconsistently would never be recognised and the walk would not terminate.
-std::string canon_key(const fs::path& p) {
-    std::string s = p.string();
+std::string canon_key(std::string s) {
 #ifdef _WIN32
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 #endif
@@ -124,11 +113,15 @@ Manifest Scanner::scan(const std::string& root,
         std::shared_ptr<const DirChain> chain;
     };
     std::vector<Pending> pending;
-    {
-        std::error_code ec;
-        fs::path real = fs::weakly_canonical(fs::path(root), ec);
-        if (ec || real.empty()) real = fs::path(root);
-        pending.push_back({std::string(), follow_ ? extend(nullptr, canon_key(real)) : nullptr});
+    if (!follow_) {
+        pending.push_back({std::string(), nullptr});
+    } else {
+        // Only a followed walk can cycle, so only it needs to know the resolved
+        // identity of where it started — and it is a lookup a plain scan, which
+        // runs on every poll, does not have to pay for.
+        std::string real = real_path(root);
+        if (real.empty()) real = root;  // unresolvable: the lexical path still keys it
+        pending.push_back({std::string(), extend(nullptr, canon_key(real))});
     }
 
     while (!pending.empty()) {
@@ -156,8 +149,10 @@ Manifest Scanner::scan(const std::string& root,
                 if (ignore_.matches(rel, /*is_dir=*/true)) continue;
                 const EntryProbe info = probe_entry(abs, follow_);
                 if (!info.symlink) {
+                    // No link was crossed to get here, so this directory's identity
+                    // is its parent's resolved key plus a name — no lookup needed.
                     pending.push_back({rel, follow_ ? extend(item.chain,
-                                                             canon_key(fs::path(item.chain->key) / e.name))
+                                                             canon_key((fs::path(item.chain->key) / e.name).string()))
                                                     : nullptr});
                     continue;
                 }
@@ -167,13 +162,12 @@ Manifest Scanner::scan(const std::string& root,
                     ++local.symlinks_skipped;
                     continue;
                 }
-                std::error_code ec;
-                const fs::path real = fs::weakly_canonical(fs::path(abs), ec);
+                const std::string real = real_path(abs);
                 // Already on the way in: this link closes a cycle, and walking it
                 // would produce loop/, loop/loop/, ... without ever finishing. A
                 // link to a directory we merely visited *elsewhere* is not a cycle
                 // and is walked again — it really is in two places.
-                if (ec || item.chain->on_path(canon_key(real))) {
+                if (real.empty() || item.chain->on_path(canon_key(real))) {
                     ++local.symlinks_skipped;
                     continue;
                 }
