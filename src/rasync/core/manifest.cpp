@@ -1,9 +1,9 @@
 #include "core/manifest.h"
 
-#include "util/fs.h"
+#include "librats/util/fs.h"
 
 extern "C" {
-#include "sha256.h"
+#include "librats/crypto/sha256.h"
 }
 
 namespace rasync {
@@ -135,18 +135,18 @@ std::optional<ManifestPatch> ManifestPatch::decode(const Bytes& data) {
 }
 
 Hash Manifest::fingerprint() const {
-    sha256_context_t ctx;
-    sha256_reset(&ctx);
+    rats_sha256_context_t ctx;
+    rats_sha256_reset(&ctx);
     for (const auto& [path, m] : entries_) {
-        sha256_update(&ctx, path.data(), path.size());
+        rats_sha256_update(&ctx, path.data(), path.size());
         uint8_t meta[8 + 4 + 32];
         for (int i = 0; i < 8; ++i) meta[i]     = static_cast<uint8_t>(m.size >> (56 - 8 * i));
         for (int i = 0; i < 4; ++i) meta[8 + i] = static_cast<uint8_t>(m.mode >> (24 - 8 * i));
         std::memcpy(meta + 12, m.hash.data(), 32);
-        sha256_update(&ctx, meta, sizeof(meta));
+        rats_sha256_update(&ctx, meta, sizeof(meta));
     }
     Hash h{};
-    sha256_finish(&ctx, h.data());
+    rats_sha256_finish(&ctx, h.data());
     return h;
 }
 

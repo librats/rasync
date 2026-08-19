@@ -48,11 +48,11 @@
 #include "core/manifest.h"
 #include "net/protocol.h"
 
-#include "peer/peer_id.h"
-#include "util/fs.h"
+#include "librats/peer/peer_id.h"
+#include "librats/util/fs.h"
 
 extern "C" {
-#include "sha256.h"
+#include "librats/crypto/sha256.h"
 }
 
 namespace rasync {
@@ -90,7 +90,7 @@ private:
         uint64_t          written = 0;
         uint64_t          on_wire = 0;   ///< literal bytes actually received
         uint64_t          last_ack = 0;  ///< `on_wire` at the last FileAck we sent
-        sha256_context_t  hash{};
+        rats_sha256_context_t  hash{};
         Hash              result_hash{};  ///< whole-file digest, filled at verify time
         bool              failed = false;
         ~Incoming();

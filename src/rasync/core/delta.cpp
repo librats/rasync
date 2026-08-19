@@ -1,7 +1,7 @@
 #include "core/delta.h"
 
 #include "core/hash.h"
-#include "util/fs.h"
+#include "librats/util/fs.h"
 
 #include <cstring>
 #include <unordered_map>

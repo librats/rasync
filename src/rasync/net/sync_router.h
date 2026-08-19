@@ -41,8 +41,8 @@
 
 #include "net/sync_service.h"
 
-#include "node/node.h"
-#include "peer/peer_id.h"
+#include "librats/node/node.h"
+#include "librats/peer/peer_id.h"
 
 namespace rasync {
 

@@ -1,7 +1,7 @@
 #include "core/scanner.h"
 
 #include "core/file_stat.h"
-#include "util/fs.h"
+#include "librats/util/fs.h"
 
 #include <algorithm>
 #include <cctype>

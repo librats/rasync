@@ -3,7 +3,7 @@
 #include "net/sync_session.h"
 
 #include "core/state_dir.h"
-#include "util/fs.h"
+#include "librats/util/fs.h"
 
 #include <filesystem>
 #include <utility>

@@ -7,7 +7,7 @@
 #include "version.h"
 #include "test_util.h"
 
-#include "node/node.h"
+#include "librats/node/node.h"
 
 #include <algorithm>
 #include <atomic>

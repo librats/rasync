@@ -8,10 +8,10 @@
 #include "net/sync_service.h"
 #include "version.h"
 
-#include "node/node.h"
-#include "subsystems/dht_discovery.h"
-#include "subsystems/mdns_discovery.h"
-#include "util/logger.h"
+#include "librats/node/node.h"
+#include "librats/subsystems/dht_discovery.h"
+#include "librats/subsystems/mdns_discovery.h"
+#include "librats/util/logger.h"
 
 #include <atomic>
 #include <chrono>

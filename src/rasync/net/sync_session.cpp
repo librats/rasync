@@ -689,14 +689,14 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
     start.u64(size); start.i64(mtime); start.u32(mode); start.u8(0);
     send_msg(start);
 
-    sha256_context_t hash; sha256_reset(&hash);
+    rats_sha256_context_t hash; rats_sha256_reset(&hash);
     const uint32_t chunk = service_.config().chunk_size;
     std::vector<uint8_t> buf(chunk);
     uint64_t sent = 0;
     for (;;) {
         size_t n = in.read(buf.data(), chunk);
         if (n == 0) break;
-        sha256_update(&hash, buf.data(), n);
+        rats_sha256_update(&hash, buf.data(), n);
         auto w = msg(proto::Op::FileLiteral);
         w.u64(job.xid); w.blob32(buf.data(), n);
         send_msg(w);
@@ -706,7 +706,7 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
         if (!running_.load()) return;
         if (n < chunk) break;
     }
-    Hash digest{}; sha256_finish(&hash, digest.data());
+    Hash digest{}; rats_sha256_finish(&hash, digest.data());
     auto end = msg(proto::Op::FileEnd);
     end.u64(job.xid); end.bytes(digest);
     send_msg(end);
@@ -841,7 +841,7 @@ void SyncSession::handle_file_start(BinaryReader& r) {
         in->base_open = in->base.open_read(in->final_path.c_str());
         if (!in->base_open) { fail_incoming(in, "delta base missing"); return; }
     }
-    sha256_reset(&in->hash);
+    rats_sha256_reset(&in->hash);
     std::lock_guard<std::mutex> lk(mtx_);
     incoming_[in->xid] = in;
 }
@@ -859,7 +859,7 @@ void SyncSession::handle_file_literal(BinaryReader& r) {
     }
     if (in->failed) return;
     if (!in->out.write_at(in->written, data.data(), data.size())) { fail_incoming(in, "write error"); return; }
-    sha256_update(&in->hash, data.data(), data.size());
+    rats_sha256_update(&in->hash, data.data(), data.size());
     in->written += data.size();
     in->on_wire += data.size();
 
@@ -897,7 +897,7 @@ void SyncSession::handle_file_copy(BinaryReader& r) {
         size_t got = in->base.read(buf.data(), want);
         if (got == 0) { fail_incoming(in, "base read"); return; }
         if (!in->out.write_at(in->written, buf.data(), got)) { fail_incoming(in, "write error"); return; }
-        sha256_update(&in->hash, buf.data(), got);
+        rats_sha256_update(&in->hash, buf.data(), got);
         in->written += got; src += got; left -= static_cast<uint32_t>(got);
     }
 }
@@ -915,7 +915,7 @@ void SyncSession::handle_file_end(BinaryReader& r) {
     }
     if (in->failed) return;
 
-    Hash got{}; sha256_finish(&in->hash, got.data());
+    Hash got{}; rats_sha256_finish(&in->hash, got.data());
     in->result_hash = got;
     if (got != expected) {
         // Integrity failure. If this was a delta, the base may have drifted — fall
