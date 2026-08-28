@@ -39,6 +39,7 @@ if(TARGET rasync_net AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_sync_integratio
     add_executable(rasync_net_tests
         test_auth.cpp
         test_protocol.cpp
+        test_send_gate.cpp
         test_sync_integration.cpp
     )
     target_include_directories(rasync_net_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -50,6 +51,7 @@ endif()
 if(TARGET rasync_app)
     add_executable(rasync_app_tests
         test_cli.cpp
+        test_dial_retry.cpp
     )
     target_include_directories(rasync_app_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(rasync_app_tests PRIVATE rasync_app GTest::gtest_main)

@@ -255,6 +255,12 @@ rasync -p 9000 ./data
 rasync --peer a.example.com:9000 ./data
 ```
 
+A `--peer` address is dialed again whenever the run has no peers left, so a
+restart on the other side, a network change or a dropped connection recovers on
+its own. The retry waits 8 s and then backs off to a couple of minutes; it is
+skipped entirely while any peer is connected, because re-dialing a live peer
+would replace the connection it is already transferring on.
+
 **Automatic discovery** — both sides find each other by a shared secret key over
 the DHT and local network; no fixed IP needed:
 
@@ -484,6 +490,12 @@ What follows from treating a link as the real thing:
 - **Folder names are matched byte for byte.** They are how two machines agree that
   two paths are one tree, so `docs` and `Docs` are different folders. A folder only
   one side has is inert and reported by name; nothing pairs it up automatically.
+- **One connection, one send queue.** Every folder a peer shares rides one
+  encrypted connection, and the transport drops a peer whose send queue it has to
+  grow past 8 MiB. Bulk sending is therefore paced against *that* queue rather
+  than per folder — otherwise several folders transferring large files at once
+  each fill it independently and the connection is closed mid-transfer. Pacing
+  waits for room; it never drops anything.
 - **Folders cost threads per peer.** A shared folder opens a session, and a session
   runs a sender and a requester thread. A folder the peer does not have costs
   neither — but many folders times many peers is still many threads.

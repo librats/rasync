@@ -15,7 +15,7 @@ std::string unknown_key(const librats::PeerId& id, uint32_t tag) {
 } // namespace
 
 SyncRouter::SyncRouter(librats::Node& node, RouterEvents events)
-    : node_(node), events_(std::move(events)) {}
+    : node_(node), events_(std::move(events)), gate_(node) {}
 
 SyncRouter::~SyncRouter() { shutdown(); }
 
@@ -23,7 +23,7 @@ SyncService* SyncRouter::add_folder(SyncConfig config, SyncEvents events) {
     // Enforced, not merely documented: dispatch reads by_tag_ from reactor threads
     // without a lock, which is only sound because the table stops changing here.
     if (attached_) return nullptr;
-    auto svc = std::make_unique<SyncService>(node_, std::move(config), std::move(events));
+    auto svc = std::make_unique<SyncService>(node_, std::move(config), std::move(events), &gate_);
     SyncService* raw = svc.get();
     if (!by_tag_.emplace(raw->tag(), raw).second) return nullptr;
     folders_.push_back(std::move(svc));
@@ -44,9 +44,18 @@ void SyncRouter::attach() {
         if (events_.peer_up) events_.peer_up(peer.id());
     });
     node_.on_peer_disconnected([this](const librats::PeerId& id) {
+        // Before the folders: stopping a session joins its sender thread, and that
+        // thread may be parked on the gate waiting for a peer that has just gone.
+        // Waking it first turns a join that waits out the poll tick into one that
+        // returns at once.
+        gate_.wake_all();
         for (auto& f : folders_) f->peer_disconnected(id);
         if (events_.peer_down) events_.peer_down(id);
     });
+    // The transport's half of the backpressure contract: send() says "stop", this
+    // says "go again". Registered here because it is a node-level handler, like
+    // the channel and the peer up/down callbacks — a folder never sees the Node.
+    node_.on_peer_writable([this](const librats::Peer&) { gate_.wake_all(); });
 }
 
 void SyncRouter::start_folders() {
@@ -58,6 +67,9 @@ void SyncRouter::start_folders() {
 
 void SyncRouter::shutdown() {
     if (stopped_.exchange(true)) return;
+    // Release every parked sender first, for the same reason as on disconnect:
+    // shutdown joins those threads.
+    gate_.stop();
     for (auto& f : folders_) f->shutdown();
 }
 

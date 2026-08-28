@@ -5,6 +5,7 @@
 #include "core/state_dir.h"
 #include "librats/util/fs.h"
 
+#include <chrono>
 #include <filesystem>
 #include <utility>
 #include <vector>
@@ -50,8 +51,10 @@ std::string default_folder_name(const std::string& root) {
     return leaf.empty() ? std::string("rasync") : leaf;
 }
 
-SyncService::SyncService(librats::Node& node, SyncConfig config, SyncEvents events)
+SyncService::SyncService(librats::Node& node, SyncConfig config, SyncEvents events,
+                         SendGate* gate)
     : node_(node),
+      gate_(gate),
       config_(with_defaults(std::move(config))),
       events_(std::move(events)),
       tag_(proto::folder_tag(config_.folder)) {}
@@ -167,8 +170,24 @@ std::string SyncService::temp_dir() const {
     return librats::combine_paths(config_.root, kTempDirName);
 }
 
-void SyncService::send(const librats::PeerId& to, const Bytes& msg) {
-    node_.send(to, proto::kChannel, librats::ByteView(msg));
+bool SyncService::send(const librats::PeerId& to, const Bytes& msg) {
+    // The answer matters. It is librats saying whether its queue for this peer
+    // still has room, and it is the only warning before the peer is dropped as a
+    // slow consumer — see net/send_gate.h. Background senders act on it; the
+    // reactor-thread callers (acks, NotFound, Bye) cannot wait and ignore it, but
+    // what they send is tiny and bounded by what they are answering.
+    return node_.send(to, proto::kChannel, librats::ByteView(msg));
+}
+
+bool SyncService::wait_writable(const librats::PeerId& to,
+                                const std::function<bool()>& keep_waiting) const {
+    if (!gate_) return true;
+    return gate_->wait_writable(
+        to, keep_waiting, std::chrono::milliseconds(config_.send_stall_timeout_ms));
+}
+
+void SyncService::wake_senders() const {
+    if (gate_) gate_->wake_all();
 }
 
 void SyncService::log(int level, const std::string& msg) const {

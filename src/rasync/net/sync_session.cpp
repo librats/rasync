@@ -211,6 +211,10 @@ void SyncSession::stop() {
         pull_cv_.notify_all();
     }
     { std::lock_guard<std::mutex> lk(send_mtx_); send_cv_.notify_all(); }
+    // running_ is false now, so a thread parked on the node-wide gate will see it
+    // and give up — but only once something wakes it. Without this the join below
+    // waits out the gate's poll tick for no reason.
+    service_.wake_senders();
     if (sender_.joinable()) sender_.join();
     if (requester_.joinable()) requester_.join();
     {
@@ -245,6 +249,23 @@ void SyncSession::handle(proto::Op op, BinaryReader& r) {
 }
 
 void SyncSession::send_msg(BinaryWriter& w) { service_.send(peer_, w.buffer()); }
+
+void SyncSession::send_paced(BinaryWriter& w) {
+    if (service_.send(peer_, w.buffer())) return;
+    // librats has told us its queue for this peer is filling. What we just handed
+    // over still goes out — nothing is dropped — but offering more would walk the
+    // connection up to the send high-water mark, where the peer is dropped as a
+    // slow consumer mid-transfer. That is not hypothetical: it is what several
+    // folders transferring large files at once used to do, because each of them
+    // paced only against its own FileAck window and the queue is shared.
+    //
+    // Only ever reached from the sender or requester thread, which hold no locks
+    // here; the reactor stays free to deliver the acks that let it drain. A false
+    // answer — shutting down, the peer gone, or the stall timing out — means carry
+    // on rather than wait further, which is why it is not acted on: the message is
+    // already sent, and the next one will ask again.
+    (void)service_.wait_writable(peer_, [this] { return running_.load(); });
+}
 
 BinaryWriter SyncSession::msg(proto::Op op) const {
     return proto::message(service_.tag(), op);
@@ -528,7 +549,10 @@ void SyncSession::send_request(const std::string& rel_path) {
         }
     }
     if (!sent_sig) w.u8(0);
-    send_msg(w);
+    // A signature runs to about 1% of the file, and the requester sends up to
+    // max_pending_pulls of them one after another — eight large files is tens of
+    // megabytes offered to the connection in a burst if nothing paces it.
+    send_paced(w);
 }
 
 void SyncSession::release_pull(const std::string& rel_path) {
@@ -699,7 +723,7 @@ void SyncSession::serve_whole(const Serve& job, const std::string& abs,
         rats_sha256_update(&hash, buf.data(), n);
         auto w = msg(proto::Op::FileLiteral);
         w.u64(job.xid); w.blob32(buf.data(), n);
-        send_msg(w);
+        send_paced(w);
         note_sent(job.xid, n);
         window_wait(job.xid);
         sent += n;
@@ -744,14 +768,17 @@ void SyncSession::serve_delta(const Serve& job, const std::string& abs,
         if (op.copy) {
             auto w = msg(proto::Op::FileCopy);
             w.u64(job.xid); w.u64(op.offset); w.u32(op.len);
-            send_msg(w);
+            // Paced even though a COPY carries no payload: the FileAck window
+            // counts literals only (COPY bytes never cross the wire), so a delta
+            // that is mostly copies has no other brake at all.
+            send_paced(w);
         } else {
             // Chunk large literal runs so one message never dominates the window.
             for (size_t off = 0; off < op.literal.size(); off += chunk) {
                 size_t n = std::min<size_t>(chunk, op.literal.size() - off);
                 auto w = msg(proto::Op::FileLiteral);
                 w.u64(job.xid); w.blob32(op.literal.data() + off, n);
-                send_msg(w);
+                send_paced(w);
                 note_sent(job.xid, n);
                 window_wait(job.xid);
                 on_wire += n;

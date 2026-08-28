@@ -21,6 +21,12 @@
  * afterwards, so the dispatch path — which every 64 KiB of file data goes
  * through — needs no lock at all.
  *
+ * The router also owns the node-wide SendGate (net/send_gate.h). Backpressure is
+ * a property of the *connection*, and one connection carries every folder, so the
+ * thing that paces sending has to live where the connection does — here — rather
+ * than once per folder, which is how four folders came to offer four windows of
+ * data to a queue with room for one.
+ *
  * A message whose tag matches no folder of ours is dropped. That is the normal
  * case whenever two peers do not share every folder, so it must be cheap and
  * silent; the exception is a `Hello`, which names its folder in full and is
@@ -39,6 +45,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "net/send_gate.h"
 #include "net/sync_service.h"
 
 #include "librats/node/node.h"
@@ -92,6 +99,10 @@ public:
     const std::vector<std::unique_ptr<SyncService>>& folders() const noexcept { return folders_; }
     size_t                                           size()    const noexcept { return folders_.size(); }
 
+    /// The gate every folder paces against. Exposed for tests and diagnostics —
+    /// a sender that stalled is otherwise invisible.
+    const SendGate& send_gate() const noexcept { return gate_; }
+
 private:
     void on_message(const librats::PeerId& from, librats::ByteView payload);
     /// Report a message for a folder we do not have — at most once per (peer, tag).
@@ -100,6 +111,8 @@ private:
 
     librats::Node&                            node_;
     RouterEvents                              events_;
+    /// Declared before the folders so it outlives every session that waits on it.
+    SendGate                                  gate_;
     std::vector<std::unique_ptr<SyncService>> folders_;
     std::unordered_map<uint32_t, SyncService*> by_tag_;   ///< fixed once attached
     bool                                      attached_ = false;

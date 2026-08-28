@@ -1,5 +1,7 @@
 #include "app/daemon.h"
 
+#include "app/dial_retry.h"
+
 #include "app/terminal.h"
 #include "core/scanner.h"
 #include "core/state_dir.h"
@@ -444,15 +446,25 @@ int run_daemon(const Options& opt) {
     }
 
     // ── dial explicit peers ──────────────────────────────────────────────────
+    // Kept, not just used once: every way a connection can end leaves an explicit
+    // peer with nothing to re-establish it, so the watch loop dials these again
+    // while nothing is connected (see app/dial_retry.h).
+    struct DialTarget { std::string spec, host; uint16_t port = 0; };
+    std::vector<DialTarget> dial_targets;
     for (const auto& spec : opt.peers) {
-        std::string host; uint16_t port = 0;
-        if (!parse_hostport(spec, host, port)) {
+        DialTarget t;
+        t.spec = spec;
+        if (!parse_hostport(spec, t.host, t.port)) {
             line(term::yellow("! ") + "ignoring bad --peer " + spec);
             continue;
         }
-        line(term::dim("dialing ") + spec + term::dim(" ..."));
-        node.connect(host, port);
+        dial_targets.push_back(std::move(t));
     }
+    for (const auto& t : dial_targets) {
+        line(term::dim("dialing ") + t.spec + term::dim(" ..."));
+        node.connect(t.host, t.port);
+    }
+    DialRetry dial_retry;
 
     if (!opt.discover && opt.peers.empty())
         line(term::yellow("note: ") + "no --peer and no --discover — waiting for inbound peers on port " +
@@ -477,6 +489,22 @@ int run_daemon(const Options& opt) {
     while (!g_stop.load()) {
         std::this_thread::sleep_for(milliseconds(200));
         auto now = steady_clock::now();
+
+        // Reconnect. Only while *nothing* is connected: librats resolves a second
+        // connection to a peer we already hold by keeping the newer one, so
+        // dialing a live peer would drop its session and whatever it was
+        // transferring. Nobody connected cannot describe a connection worth
+        // keeping, which makes this safe as well as sufficient.
+        if (!dial_targets.empty() && dial_retry.due(now, peers.load())) {
+            for (const auto& t : dial_targets) {
+                // Shown at the same volume as the startup dial: it is the same
+                // event, and a user watching a sync that stopped needs to see that
+                // something is trying. The backoff is what keeps it from being
+                // noise — one line per address every 8 s at first, then rarer.
+                line(term::dim("re-dialing ") + t.spec + term::dim(" ..."));
+                node.connect(t.host, t.port);
+            }
+        }
 
         if (opt.once) {
             // Exit once *every* folder has synced with a peer and things have

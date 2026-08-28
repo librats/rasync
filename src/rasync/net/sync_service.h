@@ -34,6 +34,7 @@
 #include "core/manifest.h"
 #include "core/delta.h"
 #include "net/protocol.h"
+#include "net/send_gate.h"
 
 #include "librats/node/node.h"
 #include "librats/peer/peer_id.h"
@@ -104,6 +105,14 @@ struct SyncConfig {
     /// split into chunks the receiver reassembles. Configurable so the chunking
     /// path can be exercised without building a million-file tree.
     size_t   max_update_bytes = proto::kMaxUpdateBytes;
+
+    /// How long a background sender waits for the transport's send queue to drain
+    /// before giving up and pushing on anyway (see net/send_gate.h). The wait has
+    /// to end somewhere: a peer that never drains is a peer the transport will
+    /// disconnect on its own, and a thread parked here forever would serve that
+    /// folder nothing ever again. Timing out restores the un-paced behaviour for
+    /// one message rather than wedging the session.
+    uint32_t send_stall_timeout_ms = 30000;
 };
 
 /// One finished file transfer, for the UI.
@@ -140,7 +149,13 @@ std::string default_folder_name(const std::string& root);
 class SyncService {
 public:
     /// `config.folder` defaults to default_folder_name(config.root) when empty.
-    SyncService(librats::Node& node, SyncConfig config, SyncEvents events = {});
+    ///
+    /// `gate` is the node-wide send gate (net/send_gate.h), owned by the
+    /// SyncRouter because backpressure is a property of the connection and every
+    /// folder shares one. Null means no pacing — every send goes straight out, as
+    /// it did before the gate existed.
+    SyncService(librats::Node& node, SyncConfig config, SyncEvents events = {},
+                SendGate* gate = nullptr);
     ~SyncService();
 
     SyncService(const SyncService&) = delete;
@@ -221,7 +236,20 @@ public:
     std::string temp_dir() const;                    ///< <root>/.rasync-tmp
     std::string ensure_temp_dir() const;             ///< create it (hidden on Windows) and return it
     void        prune_temp_dir() const;              ///< remove it again once nothing is in flight
-    void        send(const librats::PeerId& to, const Bytes& msg);
+    /// Put one message on the wire. Returns false when librats' queue for this
+    /// peer is filling up: the message is still sent, but a caller on a background
+    /// thread must stop and wait_writable() before offering more — see
+    /// net/send_gate.h for why ignoring this is what closed connections.
+    bool        send(const librats::PeerId& to, const Bytes& msg);
+    /// Block until `to`'s send queue has room again. Background threads only.
+    /// False if the caller should carry on without room (shutdown, disconnect,
+    /// or the stall timeout). No-op returning true when there is no gate.
+    bool        wait_writable(const librats::PeerId& to,
+                              const std::function<bool()>& keep_waiting) const;
+    /// Re-check every thread parked in wait_writable(). Called when a session
+    /// stops, so a sender waiting on a peer that just went away is released
+    /// before anyone tries to join it.
+    void        wake_senders() const;
     void        log(int level, const std::string& msg) const;
 
 private:
@@ -231,6 +259,7 @@ private:
     std::shared_ptr<SyncSession> session_for(const librats::PeerId& id);
 
     librats::Node&   node_;
+    SendGate*        gate_;   ///< node-wide, owned by SyncRouter; may be null
     SyncConfig       config_;
     SyncEvents       events_;
     const uint32_t   tag_;    ///< proto::folder_tag(config_.folder)

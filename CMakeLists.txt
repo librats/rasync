@@ -100,6 +100,7 @@ target_link_libraries(rasync_core PUBLIC rats)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/rasync/net/sync_session.cpp)
 add_library(rasync_net STATIC
     src/rasync/net/auth.cpp
+    src/rasync/net/send_gate.cpp
     src/rasync/net/sync_session.cpp
     src/rasync/net/sync_service.cpp
     src/rasync/net/sync_router.cpp

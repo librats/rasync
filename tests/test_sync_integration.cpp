@@ -87,12 +87,18 @@ struct Endpoint {
     /// handshake (via the derived protocol id), the second gates syncing once the
     /// handshake is through. An allow-list entry has to be a peer id we already
     /// hold, which is why the endpoint whose id is listed must be built first.
+    /// `send_queue_limit` shrinks librats' per-connection send high-water mark
+    /// (0 = the 8 MiB default). Small values reproduce, in a couple of megabytes,
+    /// the overrun that took gigabytes and several folders to provoke in the
+    /// field — the peer is dropped as a slow consumer the moment the queue is
+    /// offered more than it holds.
     explicit Endpoint(SyncMode mode = SyncMode::TwoWay, bool source = false,
                       size_t max_update_bytes = 0,
                       ConflictPolicy conflict = ConflictPolicy::Newer,
                       const std::string& key = {},
                       const std::vector<librats::PeerId>& allow = {},
-                      bool follow_symlinks = false) {
+                      bool follow_symlinks = false,
+                      size_t send_queue_limit = 0) {
         cfg.mode = mode;
         cfg.source = source;
         cfg.conflict = conflict;
@@ -106,9 +112,12 @@ struct Endpoint {
         ncfg.protocol = protocol_id(key);
         ncfg.data_dir = node_state.str();
         ncfg.enable_network_monitor = false;
+        ncfg.send_queue_limit = send_queue_limit;
         node = std::make_unique<librats::Node>(ncfg);
 
         RouterEvents rev;
+        rev.peer_up   = [this](const librats::PeerId&) { peer_ups.fetch_add(1); };
+        rev.peer_down = [this](const librats::PeerId&) { peer_downs.fetch_add(1); };
         rev.log = [this](int, const std::string& msg) {
             std::lock_guard<std::mutex> lk(log_mtx);
             logs.push_back(msg);
@@ -159,6 +168,12 @@ struct Endpoint {
     /// The folder a single-folder test means when it says "this endpoint's tree".
     Folder&       first()       { return *folders.front(); }
     const Folder& first() const { return *folders.front(); }
+
+    /// Connections seen. A drop mid-transfer is invisible in the synced tree — the
+    /// sync simply takes longer, or never finishes — so a test that cares has to
+    /// watch the count rather than the files.
+    std::atomic<int> peer_ups{0};
+    std::atomic<int> peer_downs{0};
 
     /// Node-level diagnostics the router produced (folders a peer offered that we
     /// do not have, and the like).
@@ -1225,4 +1240,145 @@ TEST(SyncIntegration, DeletesPropagateWithinTheirOwnFolder) {
     EXPECT_TRUE(disk_state(b2.root).contains("same-name.txt"))
         << "a delete in one folder removed the other folder's file of the same name";
     EXPECT_EQ(test::read_file(b2.sub("same-name.txt")), "in folder two");
+}
+
+// ── transport backpressure ───────────────────────────────────────────────────
+
+namespace {
+
+/// An endpoint whose connection queue is deliberately tiny. librats' send
+/// high-water mark is per *connection*, and a small one reproduces, in a couple of
+/// megabytes, the overrun that needed several folders and gigabytes to provoke in
+/// the field: past the mark the peer is closed as a slow consumer, mid-transfer,
+/// on a link that was never unhealthy.
+std::unique_ptr<Endpoint> narrow_endpoint(size_t queue_bytes) {
+    return std::make_unique<Endpoint>(SyncMode::TwoWay, /*source=*/false,
+                                      /*max_update_bytes=*/0, ConflictPolicy::Newer,
+                                      /*key=*/std::string{},
+                                      /*allow=*/std::vector<librats::PeerId>{},
+                                      /*follow_symlinks=*/false, queue_bytes);
+}
+
+bool file_is(const std::string& path, const std::vector<uint8_t>& want) {
+    std::error_code ec;
+    if (std::filesystem::file_size(path, ec) != want.size()) return false;
+    const std::string got = test::read_file(path);
+    return got.size() == want.size() &&
+           std::memcmp(got.data(), want.data(), want.size()) == 0;
+}
+
+} // namespace
+
+// The failure this whole mechanism exists for. One connection carries every
+// folder, so the send high-water mark is shared — but a SyncSession is per
+// (folder, peer) and used to pace itself against nothing but its own FileAck
+// window. Four folders transferring at once therefore offered four windows' worth
+// of bytes to a queue with room for one, and librats closed the peer as a slow
+// consumer part-way through. Nothing here is unhealthy about the link: it is
+// loopback, lossless and idle. The overrun is entirely the sender's own making,
+// which is why no amount of network tuning ever helped it.
+TEST(SyncIntegration, ManyFoldersDoNotOverrunOneSendQueue) {
+    // The queue has to leave room for one chunk per concurrent sender: pacing acts
+    // *after* a message is handed over, so four sessions can always be one chunk
+    // ahead each (4 x 64 KiB). What it must not leave room for is four *windows* —
+    // 16 MiB, which is what the sessions offered before the gate existed.
+    constexpr size_t kQueue   = 1024 * 1024;      // high-water; low-water is a quarter
+    constexpr size_t kPayload = 2 * 1024 * 1024;  // per folder, well past the queue
+    const char* kNames[] = {"one", "two", "three", "four"};
+
+    auto a = narrow_endpoint(kQueue);
+    auto b = narrow_endpoint(kQueue);
+    for (int i = 1; i < 4; ++i) { a->add_folder(kNames[i]); b->add_folder(kNames[i]); }
+
+    std::vector<std::vector<uint8_t>> payloads;
+    for (int i = 0; i < 4; ++i) {
+        payloads.push_back(test::random_bytes(kPayload, 4242 + i));
+        test::write_file(a->folders[i]->sub("bulk.bin"), payloads.back());
+    }
+
+    a->start();
+    b->start();
+    connect(*b, *a);
+
+    ASSERT_TRUE(wait_until([&] {
+        for (int i = 0; i < 4; ++i)
+            if (!file_is(b->folders[i]->sub("bulk.bin"), payloads[i])) return false;
+        return true;
+    }, milliseconds(90000)))
+        << "four folders never all converged — the connection was almost certainly "
+           "closed as a slow consumer (peer downs: " << b->peer_downs.load() << ")";
+
+    // The point of the test. A drop is not fatal to the *data* — the next round
+    // retries — but it restarts every transfer from zero, which is how a large
+    // file over a real link never finishes at all.
+    EXPECT_EQ(a->peer_downs.load(), 0) << "sender's connection was dropped mid-transfer";
+    EXPECT_EQ(b->peer_downs.load(), 0) << "receiver's connection was dropped mid-transfer";
+
+    // …and it stayed under the mark by waiting, not by luck. Without this the run
+    // above proves only that loopback happened to keep up.
+    EXPECT_GT(a->router->send_gate().waits(), 0u) << "the gate never engaged";
+}
+
+// A delta made of many non-contiguous COPY instructions carries almost no
+// payload, so the FileAck window never engages: it counts literal bytes only,
+// because COPY bytes are read from the receiver's own base and never cross the
+// wire. The transport's backpressure is the only thing that bounds such a stream,
+// and this test is what says so — remove the pacing from the COPY path and the
+// gate stops engaging here.
+//
+// Swapping adjacent blocks is what produces the stream: every block still matches
+// the base, so there is nothing to send, but no two consecutive matches are
+// contiguous *in the base*, so none of them coalesce into one instruction.
+//
+// Both sides are seeded with the same file so that no whole-file transfer ever
+// happens. That is what lets the serving side's queue be smaller than one 64 KiB
+// literal chunk — at which size a few thousand 25-byte COPY messages are enough
+// to reach the mark, which on loopback they never are otherwise.
+TEST(SyncIntegration, CopyOnlyDeltaIsPacedByTheTransport) {
+    constexpr size_t kQueue = 64 * 1024;         // low-water: 16 KiB
+    constexpr size_t kSize  = 8 * 1024 * 1024;   // ⇒ ~4k COPY instructions at the
+    const std::string rel   = "shuffled.bin";    //   default 2 KiB block size
+
+    auto a = narrow_endpoint(kQueue);            // serves: sends the COPY stream
+    Endpoint b;                                  // requests: sends the signature
+
+    const auto original = test::random_bytes(kSize, 31337);
+    test::write_file(a->first().sub(rel), original);
+    test::write_file(b.first().sub(rel), original);
+
+    a->start();
+    b.start();
+    connect(b, *a);
+
+    // Identical trees: they converge with nothing on the wire but manifests.
+    ASSERT_TRUE(wait_until([&] {
+        return a->first().synced_events.load() > 0 && b.first().synced_events.load() > 0;
+    })) << "the two identical trees never agreed";
+    const uint64_t waits_before = a->router->send_gate().waits();
+
+    // Swap every adjacent pair of blocks: the same bytes, all of them findable in
+    // the base, none in an order the delta can merge.
+    auto shuffled = original;
+    constexpr size_t kBlock = kDefaultBlockSize;
+    for (size_t off = 0; off + 2 * kBlock <= kSize; off += 2 * kBlock)
+        std::swap_ranges(shuffled.begin() + off, shuffled.begin() + off + kBlock,
+                         shuffled.begin() + off + kBlock);
+    // A permutation keeps the size, and mtime has one-second resolution — so the
+    // scanner's size+mtime quick-check would not re-hash the file at all and the
+    // edit would simply never be noticed. Change the length too, exactly as the
+    // other delta tests do.
+    const auto tail = test::random_bytes(29, 5);
+    shuffled.insert(shuffled.end(), tail.begin(), tail.end());
+    ASSERT_NE(shuffled, original);
+    test::write_file(a->first().sub(rel), shuffled);
+    a->publish();
+
+    ASSERT_TRUE(wait_until([&] { return file_is(b.first().sub(rel), shuffled); },
+                           milliseconds(90000)))
+        << "the copy-only delta never landed (peer downs: " << b.peer_downs.load() << ")";
+
+    EXPECT_EQ(a->peer_downs.load(), 0) << "a stream of COPY messages closed the connection";
+    EXPECT_EQ(b.peer_downs.load(), 0);
+    EXPECT_GT(a->router->send_gate().waits(), waits_before)
+        << "COPY messages went out unpaced — nothing else bounds them";
 }

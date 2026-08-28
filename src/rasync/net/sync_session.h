@@ -26,8 +26,11 @@
  *
  * Threading: protocol messages and control calls arrive on the reactor thread and
  * mutate state under `mtx_`. A sender thread drains the serve queue, honouring a
- * byte window (FileAck) via `send_cv_`; a requester thread drains the pull queue,
- * where each request costs a full read of our copy of the file. Incoming file
+ * byte window (FileAck) via `send_cv_` *and* the transport's own backpressure via
+ * the node-wide SendGate (net/send_gate.h) — the FileAck window bounds this
+ * folder's share, the gate bounds the connection every folder shares, and only the
+ * second of those is what librats will disconnect over. A requester thread drains
+ * the pull queue, where each request costs a full read of our copy of the file. Incoming file
  * writes happen on the reactor thread into a temp file, verified by SHA-256 and
  * atomically renamed into place on FileEnd. Where a session lock and the
  * service's manifest lock are both needed, `mtx_` is always taken first.
@@ -147,7 +150,14 @@ private:
     /// about to re-request it — see the comment on the definition.
     void fail_incoming(const std::shared_ptr<Incoming>& in, const std::string& why,
                        bool keep_reservation = false);
+    /// Send from a reactor thread (or anywhere that must not block). The
+    /// transport's "queue is filling" answer is discarded, so keep what goes out
+    /// this way small and bounded — acks, NotFound, Bye.
     void send_msg(BinaryWriter& w);
+    /// Send from a background thread, then wait for room if the transport asked us
+    /// to stop. This is what keeps N folders from offering N windows of bulk data
+    /// to one connection; see net/send_gate.h.
+    void send_paced(BinaryWriter& w);
     uint64_t next_xid() { return next_xid_.fetch_add(1); }
 
     SyncService&    service_;
