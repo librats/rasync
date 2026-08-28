@@ -171,19 +171,22 @@ std::string SyncService::temp_dir() const {
 }
 
 bool SyncService::send(const librats::PeerId& to, const Bytes& msg) {
-    // The answer matters. It is librats saying whether its queue for this peer
-    // still has room, and it is the only warning before the peer is dropped as a
-    // slow consumer — see net/send_gate.h. Background senders act on it; the
-    // reactor-thread callers (acks, NotFound, Bye) cannot wait and ignore it, but
-    // what they send is tiny and bounded by what they are answering.
+    // The unpaced path, for callers on the reactor thread (acks, NotFound, Bye).
+    // They cannot wait — a reactor thread waiting for its own queue to drain is a
+    // deadlock — so they discard the answer, which is safe only because what they
+    // send is tiny and bounded by what they are answering. Everything bulk goes
+    // through send_paced below.
     return node_.send(to, proto::kChannel, librats::ByteView(msg));
 }
 
-bool SyncService::wait_writable(const librats::PeerId& to,
-                                const std::function<bool()>& keep_waiting) const {
-    if (!gate_) return true;
-    return gate_->wait_writable(
-        to, keep_waiting, std::chrono::milliseconds(config_.send_stall_timeout_ms));
+bool SyncService::send_paced(const librats::PeerId& to, const Bytes& msg,
+                             const std::function<bool()>& keep_waiting) {
+    // No gate means no pacing — every send goes straight out, as it did before
+    // the gate existed. Only a SyncService built without a router is in that
+    // state, which is a test fixture rather than anything a run of rasync has.
+    if (!gate_) return send(to, msg);
+    return gate_->send(to, librats::ByteView(msg), keep_waiting,
+                       std::chrono::milliseconds(config_.send_stall_timeout_ms));
 }
 
 void SyncService::wake_senders() const {

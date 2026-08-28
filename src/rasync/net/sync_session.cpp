@@ -251,20 +251,17 @@ void SyncSession::handle(proto::Op op, BinaryReader& r) {
 void SyncSession::send_msg(BinaryWriter& w) { service_.send(peer_, w.buffer()); }
 
 void SyncSession::send_paced(BinaryWriter& w) {
-    if (service_.send(peer_, w.buffer())) return;
-    // librats has told us its queue for this peer is filling. What we just handed
-    // over still goes out — nothing is dropped — but offering more would walk the
-    // connection up to the send high-water mark, where the peer is dropped as a
-    // slow consumer mid-transfer. That is not hypothetical: it is what several
-    // folders transferring large files at once used to do, because each of them
-    // paced only against its own FileAck window and the queue is shared.
+    // Sends, and waits for room if the transport asks us to stop. That is what
+    // several folders transferring large files at once needed and did not have:
+    // each paced only against its own FileAck window, while the queue they were
+    // filling is shared by the whole connection.
     //
     // Only ever reached from the sender or requester thread, which hold no locks
-    // here; the reactor stays free to deliver the acks that let it drain. A false
-    // answer — shutting down, the peer gone, or the stall timing out — means carry
-    // on rather than wait further, which is why it is not acted on: the message is
-    // already sent, and the next one will ask again.
-    (void)service_.wait_writable(peer_, [this] { return running_.load(); });
+    // here; the reactor stays free to deliver the acks that let the queue drain.
+    // The answer is not acted on — shutting down, the peer gone, or the stall
+    // timing out all mean carry on rather than wait further, and the next message
+    // asks again.
+    (void)service_.send_paced(peer_, w.buffer(), [this] { return running_.load(); });
 }
 
 BinaryWriter SyncSession::msg(proto::Op op) const {

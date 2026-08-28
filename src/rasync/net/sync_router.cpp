@@ -15,7 +15,7 @@ std::string unknown_key(const librats::PeerId& id, uint32_t tag) {
 } // namespace
 
 SyncRouter::SyncRouter(librats::Node& node, RouterEvents events)
-    : node_(node), events_(std::move(events)), gate_(node) {}
+    : node_(node), events_(std::move(events)), gate_(node, proto::kChannel) {}
 
 SyncRouter::~SyncRouter() { shutdown(); }
 

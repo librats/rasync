@@ -236,19 +236,23 @@ public:
     std::string temp_dir() const;                    ///< <root>/.rasync-tmp
     std::string ensure_temp_dir() const;             ///< create it (hidden on Windows) and return it
     void        prune_temp_dir() const;              ///< remove it again once nothing is in flight
-    /// Put one message on the wire. Returns false when librats' queue for this
-    /// peer is filling up: the message is still sent, but a caller on a background
-    /// thread must stop and wait_writable() before offering more — see
-    /// net/send_gate.h for why ignoring this is what closed connections.
+    /// Put one message on the wire without pacing. For reactor-thread callers
+    /// only — they cannot block, so keep what goes out this way small and
+    /// bounded (acks, NotFound, Bye). Returns false when librats' queue for this
+    /// peer is filling up; a reactor-thread caller has no choice but to ignore
+    /// that, which is exactly why bulk traffic must not take this path.
     bool        send(const librats::PeerId& to, const Bytes& msg);
-    /// Block until `to`'s send queue has room again. Background threads only.
-    /// False if the caller should carry on without room (shutdown, disconnect,
-    /// or the stall timeout). No-op returning true when there is no gate.
-    bool        wait_writable(const librats::PeerId& to,
-                              const std::function<bool()>& keep_waiting) const;
-    /// Re-check every thread parked in wait_writable(). Called when a session
-    /// stops, so a sender waiting on a peer that just went away is released
-    /// before anyone tries to join it.
+    /// Put one message on the wire from a background thread, waiting afterwards
+    /// if the transport says its queue is filling. This is the path every bulk
+    /// message takes — see net/send_gate.h for why sending without it is what
+    /// closed connections. `keep_waiting` abandons the wait (a session passes its
+    /// `running_` flag). False means the caller was told to carry on without room
+    /// (shutdown, disconnect, or the stall timeout) and may be ignored.
+    bool        send_paced(const librats::PeerId& to, const Bytes& msg,
+                           const std::function<bool()>& keep_waiting);
+    /// Re-check every thread parked in the gate. Called when a session stops, so
+    /// a sender waiting on a peer that just went away is released before anyone
+    /// tries to join it.
     void        wake_senders() const;
     void        log(int level, const std::string& msg) const;
 

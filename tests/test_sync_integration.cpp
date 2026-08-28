@@ -1317,6 +1317,8 @@ TEST(SyncIntegration, ManyFoldersDoNotOverrunOneSendQueue) {
     // …and it stayed under the mark by waiting, not by luck. Without this the run
     // above proves only that loopback happened to keep up.
     EXPECT_GT(a->router->send_gate().waits(), 0u) << "the gate never engaged";
+    EXPECT_EQ(a->router->send_gate().timeouts(), 0u)
+        << "a sender gave up on a peer that was draining perfectly well";
 }
 
 // A delta made of many non-contiguous COPY instructions carries almost no
@@ -1331,9 +1333,16 @@ TEST(SyncIntegration, ManyFoldersDoNotOverrunOneSendQueue) {
 // contiguous *in the base*, so none of them coalesce into one instruction.
 //
 // Both sides are seeded with the same file so that no whole-file transfer ever
-// happens. That is what lets the serving side's queue be smaller than one 64 KiB
-// literal chunk — at which size a few thousand 25-byte COPY messages are enough
-// to reach the mark, which on loopback they never are otherwise.
+// happens: what crosses the wire is a few thousand 25-byte COPY instructions and
+// almost nothing else.
+//
+// What is asserted is that they went out *through* the pacing path, not that the
+// pacing had to wait. Whether a wait happens is a race between this sender and
+// the reactor draining what it is handed — a hundred kilobytes of COPY messages
+// reach a 16 KiB mark only if the sender gets far enough ahead — and a test that
+// asserts on winning that race passes on a quiet machine and fails on a busy
+// one. Offering them to the gate is what the code must do; waiting is what the
+// transport decides.
 TEST(SyncIntegration, CopyOnlyDeltaIsPacedByTheTransport) {
     constexpr size_t kQueue = 64 * 1024;         // low-water: 16 KiB
     constexpr size_t kSize  = 8 * 1024 * 1024;   // ⇒ ~4k COPY instructions at the
@@ -1354,7 +1363,7 @@ TEST(SyncIntegration, CopyOnlyDeltaIsPacedByTheTransport) {
     ASSERT_TRUE(wait_until([&] {
         return a->first().synced_events.load() > 0 && b.first().synced_events.load() > 0;
     })) << "the two identical trees never agreed";
-    const uint64_t waits_before = a->router->send_gate().waits();
+    const uint64_t offers_before = a->router->send_gate().offers();
 
     // Swap every adjacent pair of blocks: the same bytes, all of them findable in
     // the base, none in an order the delta can merge.
@@ -1379,6 +1388,12 @@ TEST(SyncIntegration, CopyOnlyDeltaIsPacedByTheTransport) {
 
     EXPECT_EQ(a->peer_downs.load(), 0) << "a stream of COPY messages closed the connection";
     EXPECT_EQ(b.peer_downs.load(), 0);
-    EXPECT_GT(a->router->send_gate().waits(), waits_before)
+
+    // One offer per COPY instruction, and the file is 4k blocks long. A threshold
+    // well under that says "the COPY stream went through the gate" while leaving
+    // room for however the delta happens to coalesce; take the pacing off that
+    // path and the count barely moves, because the only other paced message in
+    // this transfer is the single literal carrying the 29-byte tail.
+    EXPECT_GT(a->router->send_gate().offers() - offers_before, 1000u)
         << "COPY messages went out unpaced — nothing else bounds them";
 }
