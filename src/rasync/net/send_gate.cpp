@@ -51,7 +51,10 @@ bool SendGate::wait_writable(const librats::PeerId& peer,
         // Rounded up, so the last fraction of a millisecond before the deadline is
         // slept through rather than spun on.
         const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
-        cv_.wait_for(lk, std::min(kPoll, left), [&] {
+        // Explicit template argument, not a bare std::min: on MSVC with
+        // <windows.h> in scope `min` is a function-like macro, and `std::min(`
+        // then expands into something that no longer parses.
+        cv_.wait_for(lk, std::min<std::chrono::milliseconds>(kPoll, left), [&] {
             return stopped_.load() || generation_.load(std::memory_order_relaxed) != seen;
         });
     }
