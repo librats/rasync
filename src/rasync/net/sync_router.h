@@ -48,6 +48,7 @@
 #include "net/send_gate.h"
 #include "net/sync_service.h"
 
+#include "librats/core/types.h"   // CloseReason
 #include "librats/node/node.h"
 #include "librats/peer/peer_id.h"
 
@@ -57,7 +58,15 @@ namespace rasync {
 /// serves every folder at once, so it is reported here exactly once.
 struct RouterEvents {
     std::function<void(const librats::PeerId&)>        peer_up;
-    std::function<void(const librats::PeerId&)>        peer_down;
+    /// A peer went away, and why. The reason is carried because one of them is
+    /// not about the peer at all: `CloseReason::SlowConsumer` is librats saying
+    /// *we* kept sending with its queue already past the high-water mark — a
+    /// fault of our own pacing on a link that was never unhealthy (see
+    /// net/send_gate.h). Every other reason is the peer's or the network's, and
+    /// the answer to those is to redial and carry on. Told apart they read
+    /// differently; conflated, the answer to both is to redial and repeat
+    /// whatever caused it.
+    std::function<void(const librats::PeerId&, librats::CloseReason)> peer_down;
     std::function<void(int level, const std::string&)> log;
 };
 

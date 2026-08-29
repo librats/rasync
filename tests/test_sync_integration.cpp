@@ -117,7 +117,10 @@ struct Endpoint {
 
         RouterEvents rev;
         rev.peer_up   = [this](const librats::PeerId&) { peer_ups.fetch_add(1); };
-        rev.peer_down = [this](const librats::PeerId&) { peer_downs.fetch_add(1); };
+        rev.peer_down = [this](const librats::PeerId&, librats::CloseReason reason) {
+            peer_downs.fetch_add(1);
+            if (reason == librats::CloseReason::SlowConsumer) slow_consumer_downs.fetch_add(1);
+        };
         rev.log = [this](int, const std::string& msg) {
             std::lock_guard<std::mutex> lk(log_mtx);
             logs.push_back(msg);
@@ -174,6 +177,12 @@ struct Endpoint {
     /// watch the count rather than the files.
     std::atomic<int> peer_ups{0};
     std::atomic<int> peer_downs{0};
+    /// Of those drops, the ones librats blamed on us: we kept sending with the
+    /// peer's queue already past its high-water mark. Counted apart because it is
+    /// the only close reason the pacing tests are actually about — every other one
+    /// says something about the peer or the link, and none of them would be
+    /// evidence that the gate failed.
+    std::atomic<int> slow_consumer_downs{0};
 
     /// Node-level diagnostics the router produced (folders a peer offered that we
     /// do not have, and the like).
@@ -1269,6 +1278,43 @@ bool file_is(const std::string& path, const std::vector<uint8_t>& want) {
 
 } // namespace
 
+// The positive control for the two tests below. They both assert that nothing was
+// dropped as a slow consumer, and an assertion that something did *not* happen is
+// only worth as much as the proof that it can happen at all and would be seen: if
+// the close reason ever stopped reaching RouterEvents::peer_down, those tests
+// would keep passing while measuring nothing.
+//
+// So this drives the failure deliberately. It sends straight at the node, with no
+// gate in the path and the answer thrown away — which is precisely what librats
+// now defines a slow consumer as, since the mark is weighed on the backlog as it
+// stood *before* a message: one message is always queued whatever its size, and
+// it is offering another on top of a backlog already past the mark that closes the
+// connection.
+TEST(SyncIntegration, AnUnpacedSenderIsReportedAsASlowConsumer) {
+    constexpr size_t kQueue = 64 * 1024;
+    auto a = narrow_endpoint(kQueue);
+    Endpoint b(SyncMode::TwoWay, /*source=*/false, /*max_update_bytes=*/0,
+               ConflictPolicy::Newer, /*key=*/std::string{}, /*allow=*/{},
+               /*follow_symlinks=*/false, kQueue);
+    a->start();
+    b.start();
+    connect(*a, b);
+    ASSERT_TRUE(wait_until([&] { return a->peer_ups.load() > 0; })) << "never connected";
+
+    // Each blob is four times the whole queue, so the backlog is past the mark
+    // after the first one and every later send is the offence itself. The loop
+    // stops as soon as it has provoked the drop rather than sending a fixed
+    // amount, so a slower machine does not queue megabytes it never needed.
+    const std::vector<uint8_t> blob(4 * kQueue, 0xAB);
+    for (int i = 0; i < 500 && a->slow_consumer_downs.load() == 0; ++i)
+        (void)a->node->send(b.node->local_id(), proto::kChannel, librats::ByteView(blob));
+
+    ASSERT_TRUE(wait_until([&] { return a->slow_consumer_downs.load() > 0; },
+                           milliseconds(5000)))
+        << "an unpaced sender was never dropped, or the close reason never arrived "
+           "(peer downs: " << a->peer_downs.load() << ")";
+}
+
 // The failure this whole mechanism exists for. One connection carries every
 // folder, so the send high-water mark is shared — but a SyncSession is per
 // (folder, peer) and used to pace itself against nothing but its own FileAck
@@ -1311,6 +1357,12 @@ TEST(SyncIntegration, ManyFoldersDoNotOverrunOneSendQueue) {
     // The point of the test. A drop is not fatal to the *data* — the next round
     // retries — but it restarts every transfer from zero, which is how a large
     // file over a real link never finishes at all.
+    // Named exactly, now that the close reason reaches us: this test is about one
+    // of the ways a connection can end and not the others, and a drop the peer or
+    // the link caused would be a different bug wearing this one's failure message.
+    EXPECT_EQ(a->slow_consumer_downs.load(), 0)
+        << "librats dropped us as a slow consumer — the gate did not hold the "
+           "shared queue under the mark";
     EXPECT_EQ(a->peer_downs.load(), 0) << "sender's connection was dropped mid-transfer";
     EXPECT_EQ(b->peer_downs.load(), 0) << "receiver's connection was dropped mid-transfer";
 
@@ -1386,6 +1438,8 @@ TEST(SyncIntegration, CopyOnlyDeltaIsPacedByTheTransport) {
                            milliseconds(90000)))
         << "the copy-only delta never landed (peer downs: " << b.peer_downs.load() << ")";
 
+    EXPECT_EQ(a->slow_consumer_downs.load(), 0)
+        << "the COPY stream outran the queue and librats dropped us for it";
     EXPECT_EQ(a->peer_downs.load(), 0) << "a stream of COPY messages closed the connection";
     EXPECT_EQ(b.peer_downs.load(), 0);
 

@@ -10,6 +10,7 @@
 #include "net/sync_service.h"
 #include "version.h"
 
+#include "librats/core/types.h"   // CloseReason, to_string
 #include "librats/node/node.h"
 #include "librats/subsystems/dht_discovery.h"
 #include "librats/subsystems/mdns_discovery.h"
@@ -255,9 +256,21 @@ int run_daemon(const Options& opt) {
         peers.fetch_add(1);
         line(term::green("●") + " connected to peer " + term::bold(short_id(id)));
     };
-    rev.peer_down = [&peers](const librats::PeerId& id) {
+    rev.peer_down = [&peers](const librats::PeerId& id, librats::CloseReason reason) {
         peers.fetch_sub(1);
-        line(term::yellow("○") + " peer " + term::bold(short_id(id)) + " disconnected");
+        // A slow-consumer drop is the one reason that is our own doing: librats
+        // closed the peer because we kept sending with its queue already past the
+        // high-water mark. It reads as an ordinary disconnect and it is not one —
+        // the link was fine — so it is called out rather than folded in with the
+        // peer simply leaving. Anything else is the peer's or the network's, and
+        // reconnecting is the whole answer.
+        if (reason == librats::CloseReason::SlowConsumer) {
+            line(term::red("○") + " peer " + term::bold(short_id(id)) +
+                 " dropped us as a slow consumer — sent faster than the link drained");
+        } else {
+            line(term::yellow("○") + " peer " + term::bold(short_id(id)) + " disconnected" +
+                 term::dim(" (" + std::string(librats::to_string(reason)) + ")"));
+        }
     };
     rev.log = [verbosity](int level, const std::string& msg) {
         if (level >= 2) { if (verbosity >= 1) line(term::yellow("! ") + msg); }

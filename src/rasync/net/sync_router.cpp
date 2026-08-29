@@ -43,14 +43,17 @@ void SyncRouter::attach() {
         for (auto& f : folders_) f->peer_connected(peer.id());
         if (events_.peer_up) events_.peer_up(peer.id());
     });
-    node_.on_peer_disconnected([this](const librats::PeerId& id) {
+    node_.on_peer_disconnected([this](const librats::PeerId& id, librats::CloseReason reason) {
         // Before the folders: stopping a session joins its sender thread, and that
         // thread may be parked on the gate waiting for a peer that has just gone.
         // Waking it first turns a join that waits out the poll tick into one that
         // returns at once.
         gate_.wake_all();
+        // The reason goes no further than here. Tearing a session down is the same
+        // work whatever closed the connection, so a SyncService never asks: the
+        // reason is diagnosis, and diagnosis belongs to whoever reports to the user.
         for (auto& f : folders_) f->peer_disconnected(id);
-        if (events_.peer_down) events_.peer_down(id);
+        if (events_.peer_down) events_.peer_down(id, reason);
     });
     // The transport's half of the backpressure contract: send() says "stop", this
     // says "go again". Registered here because it is a node-level handler, like
